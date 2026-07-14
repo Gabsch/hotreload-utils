@@ -12,7 +12,7 @@
     <!-- roslyn -->
     <MicrosoftCodeAnalysisVersion>5.6.0-2.26178.1</MicrosoftCodeAnalysisVersion>
     <!-- arcade -->
-    <MicrosoftDotNetBuildTasksTemplatingVersion>11.0.0-beta.26177.6</MicrosoftDotNetBuildTasksTemplatingVersion>
+    <MicrosoftDotNetBuildTasksTemplatingVersion>10.0.0-beta.25578.106</MicrosoftDotNetBuildTasksTemplatingVersion>
     <MicrosoftDotNetRemoteExecutorVersion>11.0.0-beta.26177.6</MicrosoftDotNetRemoteExecutorVersion>
     <MicrosoftDotNetXUnitExtensionsVersion>11.0.0-beta.26177.6</MicrosoftDotNetXUnitExtensionsVersion>
     <MicrosoftDotNetXUnitConsoleRunnerVersion>2.9.3-beta.26177.6</MicrosoftDotNetXUnitConsoleRunnerVersion>
