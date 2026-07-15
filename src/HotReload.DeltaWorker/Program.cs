@@ -35,7 +35,7 @@ while (await Console.In.ReadLineAsync() is { } line)
         {
             throw new WorkerException(
                 "hot_reload_protocol_mismatch",
-                $"Vision Hot Reload worker protocol v{ProtocolVersion} is required.");
+                $"Hot Reload delta worker protocol v{ProtocolVersion} is required.");
         }
 
         var result = request.Method switch
@@ -98,7 +98,7 @@ static async Task<object> StartSessionAsync(
             "projectPath must identify an existing .csproj under workspaceRoot.");
     }
 
-    var session = await VisionHotReloadSession.StartAsync(
+    var session = await HotReloadDeltaSession.StartAsync(
         projectPath,
         request.Configuration,
         request.TargetFramework,
@@ -166,12 +166,12 @@ static async Task<object> PrepareUpdateAsync(
                 $"Changed document is outside the workspace or is not C#: {document.FilePath}");
         }
 
-        return new VisionHotReloadDocumentChange(filePath, document.Text);
+        return new HotReloadDeltaDocumentChange(filePath, document.Text);
     }).ToArray();
     var prepared = await session.Session.PrepareUpdateAsync(changes);
     var updateId = "upd_" + Guid.NewGuid().ToString("N");
     var artifacts = new List<ArtifactData>();
-    if (prepared.Status == VisionHotReloadUpdateStatus.Ready)
+    if (prepared.Status == HotReloadDeltaUpdateStatus.Ready)
     {
         Directory.CreateDirectory(artifactDirectory);
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dmeta", "metadata", prepared.MetadataDelta.AsSpan()));
@@ -343,7 +343,7 @@ internal sealed class WorkerSession(
     string sessionId,
     string workspaceRoot,
     IReadOnlyList<string> runtimeCapabilities,
-    VisionHotReloadSession session,
+    HotReloadDeltaSession session,
     Guid moduleId)
 {
     public string SessionId { get; } = sessionId;
@@ -352,7 +352,7 @@ internal sealed class WorkerSession(
 
     public IReadOnlyList<string> RuntimeCapabilities { get; } = runtimeCapabilities;
 
-    public VisionHotReloadSession Session { get; } = session;
+    public HotReloadDeltaSession Session { get; } = session;
 
     public Guid ModuleId { get; } = moduleId;
 

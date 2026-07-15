@@ -9,16 +9,16 @@ using System.Threading.Tasks;
 using Microsoft.DotNet.HotReload.Utils.Generator;
 using Xunit;
 
-namespace Vision.HotReload.Generator.Tests;
+namespace HotReload.DeltaGenerator.Tests;
 
-public sealed class VisionHotReloadSessionTests
+public sealed class HotReloadDeltaSessionTests
 {
     [Fact]
     public async Task Session_PreparesDiscardsRegeneratesAndCommitsLineStableUpdates()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
-        using var session = await VisionHotReloadSession.StartAsync(
+        using var session = await HotReloadDeltaSession.StartAsync(
             fixture.ProjectPath,
             "Debug",
             "net10.0",
@@ -29,7 +29,7 @@ public sealed class VisionHotReloadSessionTests
         var first = await session.PrepareUpdateAsync([
             new(fixture.SourcePath, ProjectFixture.Source(2))
         ], cancellationToken);
-        Assert.Equal(VisionHotReloadUpdateStatus.Ready, first.Status);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, first.Status);
         Assert.NotEmpty(first.MetadataDelta);
         Assert.NotEmpty(first.IlDelta);
         Assert.NotEmpty(first.PdbDelta);
@@ -39,14 +39,14 @@ public sealed class VisionHotReloadSessionTests
         var regenerated = await session.PrepareUpdateAsync([
             new(fixture.SourcePath, ProjectFixture.Source(2))
         ], cancellationToken);
-        Assert.Equal(VisionHotReloadUpdateStatus.Ready, regenerated.Status);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, regenerated.Status);
         Assert.Equal(first.ModuleId, regenerated.ModuleId);
         session.CommitUpdate();
 
         var second = await session.PrepareUpdateAsync([
             new(fixture.SourcePath, ProjectFixture.Source(3))
         ], cancellationToken);
-        Assert.Equal(VisionHotReloadUpdateStatus.Ready, second.Status);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, second.Status);
         session.DiscardUpdate();
     }
 
@@ -55,7 +55,7 @@ public sealed class VisionHotReloadSessionTests
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
-        using var session = await VisionHotReloadSession.StartAsync(
+        using var session = await HotReloadDeltaSession.StartAsync(
             fixture.ProjectPath,
             "Debug",
             "net10.0",
@@ -67,7 +67,7 @@ public sealed class VisionHotReloadSessionTests
             new(fixture.SourcePath, ProjectFixture.Source(2) + Environment.NewLine)
         ], cancellationToken);
 
-        Assert.Equal(VisionHotReloadUpdateStatus.RestartRequired, update.Status);
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
         Assert.False(update.LineUpdatesComplete);
         Assert.False(session.HasPendingUpdate);
     }
@@ -89,7 +89,7 @@ public sealed class VisionHotReloadSessionTests
 
         public static async Task<ProjectFixture> CreateAsync(CancellationToken cancellationToken)
         {
-            var root = Path.Combine(Path.GetTempPath(), "vision-hotreload-generator-tests", Guid.NewGuid().ToString("N"));
+            var root = Path.Combine(Path.GetTempPath(), "hotreload-delta-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
             var fixture = new ProjectFixture(root);
             await File.WriteAllTextAsync(fixture.ProjectPath, """

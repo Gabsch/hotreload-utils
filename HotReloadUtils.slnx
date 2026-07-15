@@ -2,10 +2,10 @@
   <Folder Name="/tests/">
     <Project Path="tests/BuildTool/ImportExplcitly.ShouldNotRun.Tests/ImportExplicitly.ShouldNotRun.Tests.csproj" />
     <Project Path="tests/BuildTool/ImportExplcitly.Tests/ImportExplicitly.Tests.csproj" />
-    <Project Path="tests/Vision.HotReload.Generator.Tests/Vision.HotReload.Generator.Tests.csproj" />
+    <Project Path="tests/HotReload.DeltaGenerator.Tests/HotReload.DeltaGenerator.Tests.csproj" />
   </Folder>
   <Project Path="src/hotreload-delta-gen/src/hotreload-delta-gen.csproj" />
-  <Project Path="src/Vision.HotReload.Worker/Vision.HotReload.Worker.csproj" />
+  <Project Path="src/HotReload.DeltaWorker/HotReload.DeltaWorker.csproj" />
   <Project Path="src/Microsoft.DotNet.HotReload.Utils.Generator.BuildTool/Microsoft.DotNet.HotReload.Utils.Generator.BuildTool.csproj" />
   <Project Path="src/Microsoft.DotNet.HotReload.Utils.Generator.Data/Microsoft.DotNet.HotReload.Utils.Generator.Data.csproj" />
   <Project Path="src/Microsoft.DotNet.HotReload.Utils.Generator.Frontend/Microsoft.DotNet.HotReload.Utils.Generator.Frontend.csproj" />

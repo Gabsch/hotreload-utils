@@ -2,7 +2,8 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <AssemblyName>Vision.HotReload.Worker</AssemblyName>
+    <AssemblyName>HotReload.DeltaWorker</AssemblyName>
+    <UseAppHost>false</UseAppHost>
   </PropertyGroup>
 
   <ItemGroup>

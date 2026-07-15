@@ -15,7 +15,7 @@ using Microsoft.CodeAnalysis.Text;
 
 namespace Microsoft.DotNet.HotReload.Utils.Generator;
 
-public enum VisionHotReloadUpdateStatus
+public enum HotReloadDeltaUpdateStatus
 {
     Ready,
     NoChanges,
@@ -23,7 +23,7 @@ public enum VisionHotReloadUpdateStatus
     RestartRequired
 }
 
-public sealed record VisionHotReloadDiagnostic(
+public sealed record HotReloadDeltaDiagnostic(
     string Id,
     string Severity,
     string Message,
@@ -32,7 +32,7 @@ public sealed record VisionHotReloadDiagnostic(
     int? Column,
     bool IsRudeEdit);
 
-public sealed record VisionHotReloadSessionInfo(
+public sealed record HotReloadDeltaSessionInfo(
     string ProjectPath,
     string Configuration,
     string? TargetFramework,
@@ -40,10 +40,10 @@ public sealed record VisionHotReloadSessionInfo(
     string PdbPath,
     string ModuleName);
 
-public sealed record VisionHotReloadDocumentChange(string FilePath, string Text);
+public sealed record HotReloadDeltaDocumentChange(string FilePath, string Text);
 
-public sealed record VisionHotReloadPreparedUpdate(
-    VisionHotReloadUpdateStatus Status,
+public sealed record HotReloadDeltaPreparedUpdate(
+    HotReloadDeltaUpdateStatus Status,
     string ModuleName,
     Guid ModuleId,
     ImmutableArray<string> ChangedFiles,
@@ -52,7 +52,7 @@ public sealed record VisionHotReloadPreparedUpdate(
     ImmutableArray<byte> PdbDelta,
     ImmutableArray<int> UpdatedTypes,
     ImmutableArray<string> RequiredCapabilities,
-    ImmutableArray<VisionHotReloadDiagnostic> Diagnostics,
+    ImmutableArray<HotReloadDeltaDiagnostic> Diagnostics,
     bool LineUpdatesComplete,
     ImmutableArray<string> Warnings);
 
@@ -61,7 +61,7 @@ public sealed record VisionHotReloadPreparedUpdate(
 /// Unlike the experimental CLI runner, preparing an update does not advance
 /// the baseline until the caller explicitly commits it.
 /// </summary>
-public sealed class VisionHotReloadSession : IDisposable
+public sealed class HotReloadDeltaSession : IDisposable
 {
     private readonly HotReloadService hotReloadService;
     private Solution solution;
@@ -69,11 +69,11 @@ public sealed class VisionHotReloadSession : IDisposable
     private Solution? pendingSolution;
     private bool ended;
 
-    private VisionHotReloadSession(
+    private HotReloadDeltaSession(
         HotReloadService hotReloadService,
         Solution solution,
         ProjectId projectId,
-        VisionHotReloadSessionInfo info)
+        HotReloadDeltaSessionInfo info)
     {
         this.hotReloadService = hotReloadService;
         this.solution = solution;
@@ -81,11 +81,11 @@ public sealed class VisionHotReloadSession : IDisposable
         Info = info;
     }
 
-    public VisionHotReloadSessionInfo Info { get; }
+    public HotReloadDeltaSessionInfo Info { get; }
 
     public bool HasPendingUpdate => pendingSolution is not null;
 
-    public static async Task<VisionHotReloadSession> StartAsync(
+    public static async Task<HotReloadDeltaSession> StartAsync(
         string projectPath,
         string configuration,
         string? targetFramework,
@@ -134,22 +134,22 @@ public sealed class VisionHotReloadSession : IDisposable
             throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
         }
 
-        var info = new VisionHotReloadSessionInfo(
+        var info = new HotReloadDeltaSessionInfo(
             builder.ProjectPath,
             configuration,
             targetFramework,
             outputAssembly,
             pdbPath,
             Path.GetFileName(outputAssembly));
-        return new VisionHotReloadSession(
+        return new HotReloadDeltaSession(
             artifacts.HotReloadService,
             artifacts.BaselineSolution,
             artifacts.BaselineProjectId,
             info);
     }
 
-    public async Task<VisionHotReloadPreparedUpdate> PrepareUpdateAsync(
-        IReadOnlyList<VisionHotReloadDocumentChange> changes,
+    public async Task<HotReloadDeltaPreparedUpdate> PrepareUpdateAsync(
+        IReadOnlyList<HotReloadDeltaDocumentChange> changes,
         CancellationToken cancellationToken = default)
     {
         ThrowIfEnded();
@@ -201,7 +201,7 @@ public sealed class VisionHotReloadSession : IDisposable
         if (!hasTextChanges)
         {
             return new(
-                VisionHotReloadUpdateStatus.NoChanges,
+                HotReloadDeltaUpdateStatus.NoChanges,
                 Info.ModuleName,
                 Guid.Empty,
                 [],
@@ -232,7 +232,7 @@ public sealed class VisionHotReloadSession : IDisposable
         {
             hotReloadService.DiscardUpdate();
             return new(
-                VisionHotReloadUpdateStatus.Blocked,
+                HotReloadDeltaUpdateStatus.Blocked,
                 Info.ModuleName,
                 Guid.Empty,
                 changedFiles.ToImmutable(),
@@ -253,7 +253,7 @@ public sealed class VisionHotReloadSession : IDisposable
         {
             hotReloadService.DiscardUpdate();
             return new(
-                VisionHotReloadUpdateStatus.RestartRequired,
+                HotReloadDeltaUpdateStatus.RestartRequired,
                 Info.ModuleName,
                 Guid.Empty,
                 changedFiles.ToImmutable(),
@@ -270,7 +270,7 @@ public sealed class VisionHotReloadSession : IDisposable
         if (updates.Status == HotReloadService.Status.NoChangesToApply || updates.ProjectUpdates.IsEmpty)
         {
             return new(
-                VisionHotReloadUpdateStatus.NoChanges,
+                HotReloadDeltaUpdateStatus.NoChanges,
                 Info.ModuleName,
                 Guid.Empty,
                 changedFiles.ToImmutable(),
@@ -287,13 +287,13 @@ public sealed class VisionHotReloadSession : IDisposable
         if (updates.ProjectUpdates.Length != 1 || updates.ProjectUpdates[0].ProjectId != projectId)
         {
             hotReloadService.DiscardUpdate();
-            return RestartRequired(changes, "Vision Hot Reload v1 supports exactly one emitting project per update.");
+            return RestartRequired(changes, "Hot Reload delta v1 supports exactly one emitting project per update.");
         }
 
         var update = updates.ProjectUpdates[0];
         pendingSolution = updatedSolution;
         return new(
-            VisionHotReloadUpdateStatus.Ready,
+            HotReloadDeltaUpdateStatus.Ready,
             Info.ModuleName,
             update.ModuleId,
             changedFiles.ToImmutable(),
@@ -349,10 +349,10 @@ public sealed class VisionHotReloadSession : IDisposable
         ended = true;
     }
 
-    private VisionHotReloadPreparedUpdate RestartRequired(
-        IReadOnlyList<VisionHotReloadDocumentChange> changes,
+    private HotReloadDeltaPreparedUpdate RestartRequired(
+        IReadOnlyList<HotReloadDeltaDocumentChange> changes,
         string warning) => new(
-            VisionHotReloadUpdateStatus.RestartRequired,
+            HotReloadDeltaUpdateStatus.RestartRequired,
             Info.ModuleName,
             Guid.Empty,
             changes.Select(change => Path.GetFullPath(change.FilePath)).ToImmutableArray(),
@@ -365,7 +365,7 @@ public sealed class VisionHotReloadSession : IDisposable
             LineUpdatesComplete: false,
             [warning]);
 
-    private static VisionHotReloadDiagnostic ToDiagnostic(Diagnostic diagnostic, bool isRudeEdit = false)
+    private static HotReloadDeltaDiagnostic ToDiagnostic(Diagnostic diagnostic, bool isRudeEdit = false)
     {
         var span = diagnostic.Location.IsInSource ? diagnostic.Location.GetLineSpan() : default;
         return new(
