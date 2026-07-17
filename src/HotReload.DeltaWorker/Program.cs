@@ -13,7 +13,7 @@ using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Microsoft.DotNet.HotReload.Utils.Generator;
 
-const int ProtocolVersion = 1;
+const int ProtocolVersion = 2;
 var protocolOutput = Console.Out;
 Console.SetOut(Console.Error);
 var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -191,6 +191,8 @@ static async Task<object> PrepareUpdateAsync(
         changedFiles = prepared.ChangedFiles,
         artifacts,
         updatedTypes = prepared.UpdatedTypes,
+        updatedMethods = prepared.UpdatedMethods,
+        changedDocuments = prepared.ChangedDocuments,
         requiredCapabilities = prepared.RequiredCapabilities,
         diagnostics = prepared.Diagnostics,
         lineUpdatesComplete = prepared.LineUpdatesComplete,

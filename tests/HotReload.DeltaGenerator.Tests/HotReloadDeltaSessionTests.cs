@@ -33,6 +33,10 @@ public sealed class HotReloadDeltaSessionTests
         Assert.NotEmpty(first.MetadataDelta);
         Assert.NotEmpty(first.IlDelta);
         Assert.NotEmpty(first.PdbDelta);
+        Assert.NotEmpty(first.UpdatedMethods);
+        var changedDocument = Assert.Single(first.ChangedDocuments);
+        Assert.Equal(fixture.SourcePath, changedDocument.FilePath);
+        Assert.NotEqual(changedDocument.BaselineSha256, changedDocument.UpdatedSha256);
         Assert.True(session.HasPendingUpdate);
 
         session.DiscardUpdate();
@@ -41,6 +45,8 @@ public sealed class HotReloadDeltaSessionTests
         ], cancellationToken);
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, regenerated.Status);
         Assert.Equal(first.ModuleId, regenerated.ModuleId);
+        Assert.Equal(first.UpdatedMethods, regenerated.UpdatedMethods);
+        Assert.Equal(first.ChangedDocuments, regenerated.ChangedDocuments);
         session.CommitUpdate();
 
         var second = await session.PrepareUpdateAsync([

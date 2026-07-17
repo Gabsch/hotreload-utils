@@ -6,6 +6,9 @@ using System.Collections.Generic;
 using System.Collections.Immutable;
 using System.IO;
 using System.Linq;
+using System.Reflection.Metadata;
+using System.Reflection.Metadata.Ecma335;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -42,6 +45,11 @@ public sealed record HotReloadDeltaSessionInfo(
 
 public sealed record HotReloadDeltaDocumentChange(string FilePath, string Text);
 
+public sealed record HotReloadDeltaChangedDocumentEvidence(
+    string FilePath,
+    string BaselineSha256,
+    string UpdatedSha256);
+
 public sealed record HotReloadDeltaPreparedUpdate(
     HotReloadDeltaUpdateStatus Status,
     string ModuleName,
@@ -51,6 +59,8 @@ public sealed record HotReloadDeltaPreparedUpdate(
     ImmutableArray<byte> IlDelta,
     ImmutableArray<byte> PdbDelta,
     ImmutableArray<int> UpdatedTypes,
+    ImmutableArray<int> UpdatedMethods,
+    ImmutableArray<HotReloadDeltaChangedDocumentEvidence> ChangedDocuments,
     ImmutableArray<string> RequiredCapabilities,
     ImmutableArray<HotReloadDeltaDiagnostic> Diagnostics,
     bool LineUpdatesComplete,
@@ -165,6 +175,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         var updatedSolution = solution;
         var changedFiles = ImmutableArray.CreateBuilder<string>(changes.Count);
+        var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(changes.Count);
         var hasTextChanges = false;
         foreach (var change in changes)
         {
@@ -195,6 +206,10 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             updatedSolution = updatedSolution.WithDocumentText(document.Id, newText);
             changedFiles.Add(path);
+            changedDocuments.Add(new(
+                path,
+                ContentHash(oldText),
+                ContentHash(newText)));
             hasTextChanges = true;
         }
 
@@ -204,6 +219,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 HotReloadDeltaUpdateStatus.NoChanges,
                 Info.ModuleName,
                 Guid.Empty,
+                [],
+                [],
                 [],
                 [],
                 [],
@@ -241,6 +258,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 [],
                 [],
                 [],
+                changedDocuments.ToImmutable(),
+                [],
                 diagnostics,
                 LineUpdatesComplete: true,
                 []);
@@ -262,6 +281,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 [],
                 [],
                 [],
+                changedDocuments.ToImmutable(),
+                [],
                 diagnostics,
                 LineUpdatesComplete: true,
                 ["Roslyn classified the edit as requiring rebuild, redeploy, or restart."]);
@@ -278,6 +299,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 [],
                 [],
                 [],
+                [],
+                changedDocuments.ToImmutable(),
                 [],
                 diagnostics,
                 LineUpdatesComplete: true,
@@ -301,6 +324,8 @@ public sealed class HotReloadDeltaSession : IDisposable
             update.ILDelta,
             update.PdbDelta,
             update.UpdatedTypes,
+            GetUpdatedMethodTokens(update.MetadataDelta),
+            changedDocuments.ToImmutable(),
             update.RequiredCapabilities,
             diagnostics,
             LineUpdatesComplete: true,
@@ -362,6 +387,8 @@ public sealed class HotReloadDeltaSession : IDisposable
             [],
             [],
             [],
+            [],
+            [],
             LineUpdatesComplete: false,
             [warning]);
 
@@ -380,6 +407,21 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     private static bool ContainsLineDirective(SourceText text) =>
         text.ToString().Contains("#line", StringComparison.Ordinal);
+
+    private static string ContentHash(SourceText text) =>
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString()))).ToLowerInvariant();
+
+    private static ImmutableArray<int> GetUpdatedMethodTokens(ImmutableArray<byte> metadataDelta)
+    {
+        using var provider = MetadataReaderProvider.FromMetadataImage(metadataDelta);
+        var reader = provider.GetMetadataReader();
+        return reader.GetEditAndContinueMapEntries()
+            .Where(static handle => handle.Kind == HandleKind.MethodDefinition)
+            .Select(static handle => MetadataTokens.GetToken(handle))
+            .Distinct()
+            .Order()
+            .ToImmutableArray();
+    }
 
     private void ThrowIfEnded()
     {
