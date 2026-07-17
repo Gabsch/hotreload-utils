@@ -179,7 +179,10 @@ static async Task<object> PrepareUpdateAsync(
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dmeta", "metadata", prepared.MetadataDelta.AsSpan()));
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dil", "il", prepared.IlDelta.AsSpan()));
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dpdb", "pdb", prepared.PdbDelta.AsSpan()));
-        artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dlines", "lineUpdates", [0, 0, 0, 0]));
+        artifacts.Add(WriteLineUpdatesArtifact(
+            artifactDirectory,
+            updateId + ".dlines",
+            prepared.LineUpdates));
         session.PendingUpdateId = updateId;
     }
 
@@ -207,6 +210,42 @@ static bool IsExperimentalLineUpdateEnabled()
     var value = Environment.GetEnvironmentVariable("VISION_HOT_RELOAD_EXPERIMENTAL_LINE_UPDATES");
     return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
         string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
+}
+
+static ArtifactData WriteLineUpdatesArtifact(
+    string artifactDirectory,
+    string fileName,
+    IReadOnlyList<HotReloadDeltaLineUpdate> updates)
+{
+    var path = Path.Combine(artifactDirectory, fileName);
+    var groupedUpdates = updates
+        .GroupBy(update => update.FilePath, StringComparer.Ordinal)
+        .ToArray();
+    using (var stream = File.Create(path))
+    using (var writer = new BinaryWriter(stream))
+    {
+        writer.Write(groupedUpdates.Length);
+        foreach (var group in groupedUpdates)
+        {
+            var pathBytes = System.Text.Encoding.UTF8.GetBytes(group.Key);
+            writer.Write(pathBytes.Length);
+            writer.Write(pathBytes);
+            var entries = group.ToArray();
+            writer.Write(entries.Length);
+            foreach (var update in entries)
+            {
+                writer.Write(update.NewLine);
+                writer.Write(update.OldLine);
+            }
+        }
+    }
+
+    var content = File.ReadAllBytes(path);
+    return new(
+        "lineUpdates",
+        path,
+        content.Length,
+        Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant());
 }
 
 static object CommitUpdate(

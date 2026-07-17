@@ -98,7 +98,10 @@ public sealed class HotReloadDeltaSessionTests
 
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
         Assert.NotEmpty(update.PdbDelta);
-        Assert.False(update.LineUpdatesComplete);
+        Assert.True(update.LineUpdatesComplete);
+        var lineUpdate = Assert.Single(update.LineUpdates);
+        Assert.Equal(fixture.SourcePath, lineUpdate.FilePath);
+        Assert.Equal(lineUpdate.OldLine + 1, lineUpdate.NewLine);
         Assert.Contains(update.Warnings, warning => warning.Contains("line-map sidecar", StringComparison.Ordinal));
         Assert.True(session.HasPendingUpdate);
         session.DiscardUpdate();

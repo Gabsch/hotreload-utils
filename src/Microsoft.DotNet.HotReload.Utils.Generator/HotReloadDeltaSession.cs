@@ -50,6 +50,11 @@ public sealed record HotReloadDeltaChangedDocumentEvidence(
     string BaselineSha256,
     string UpdatedSha256);
 
+public sealed record HotReloadDeltaLineUpdate(
+    string FilePath,
+    int NewLine,
+    int OldLine);
+
 public sealed record HotReloadDeltaPreparedUpdate(
     HotReloadDeltaUpdateStatus Status,
     string ModuleName,
@@ -64,7 +69,10 @@ public sealed record HotReloadDeltaPreparedUpdate(
     ImmutableArray<string> RequiredCapabilities,
     ImmutableArray<HotReloadDeltaDiagnostic> Diagnostics,
     bool LineUpdatesComplete,
-    ImmutableArray<string> Warnings);
+    ImmutableArray<string> Warnings)
+{
+    public ImmutableArray<HotReloadDeltaLineUpdate> LineUpdates { get; init; } = [];
+}
 
 /// <summary>
 /// Session-oriented wrapper around the official Roslyn Hot Reload service.
@@ -177,6 +185,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         var updatedSolution = solution;
         var changedFiles = ImmutableArray.CreateBuilder<string>(changes.Count);
         var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(changes.Count);
+        var lineUpdates = ImmutableArray.CreateBuilder<HotReloadDeltaLineUpdate>();
         var hasTextChanges = false;
         var hasExperimentalLineUpdates = false;
         foreach (var change in changes)
@@ -208,6 +217,10 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             hasExperimentalLineUpdates |= lineCountChanged;
+            if (lineCountChanged)
+            {
+                lineUpdates.Add(CreateLineUpdate(path, oldText, newText));
+            }
 
             updatedSolution = updatedSolution.WithDocumentText(document.Id, newText);
             changedFiles.Add(path);
@@ -333,10 +346,13 @@ public sealed class HotReloadDeltaSession : IDisposable
             changedDocuments.ToImmutable(),
             update.RequiredCapabilities,
             diagnostics,
-            LineUpdatesComplete: !hasExperimentalLineUpdates,
+            LineUpdatesComplete: true,
             hasExperimentalLineUpdates
-                ? ["Experimental line-moving update emitted a Roslyn PDB delta; the netcoredbg line-map sidecar remains incomplete."]
-                : []);
+                ? ["Experimental line-moving update emitted a constrained netcoredbg line-map sidecar for one net line-count shift."]
+                : [])
+        {
+            LineUpdates = lineUpdates.ToImmutable()
+        };
     }
 
     public void CommitUpdate()
@@ -414,6 +430,23 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     private static bool ContainsLineDirective(SourceText text) =>
         text.ToString().Contains("#line", StringComparison.Ordinal);
+
+    private static HotReloadDeltaLineUpdate CreateLineUpdate(
+        string filePath,
+        SourceText oldText,
+        SourceText newText)
+    {
+        var commonPrefix = 0;
+        var comparableLineCount = Math.Min(oldText.Lines.Count, newText.Lines.Count);
+        while (commonPrefix < comparableLineCount &&
+            oldText.Lines[commonPrefix].ToString() == newText.Lines[commonPrefix].ToString())
+        {
+            commonPrefix++;
+        }
+
+        var lineDelta = newText.Lines.Count - oldText.Lines.Count;
+        return new(filePath, commonPrefix + lineDelta, commonPrefix);
+    }
 
     private static string ContentHash(SourceText text) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString()))).ToLowerInvariant();
