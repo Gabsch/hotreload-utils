@@ -168,7 +168,9 @@ static async Task<object> PrepareUpdateAsync(
 
         return new HotReloadDeltaDocumentChange(filePath, document.Text);
     }).ToArray();
-    var prepared = await session.Session.PrepareUpdateAsync(changes);
+    var prepared = await session.Session.PrepareUpdateAsync(
+        changes,
+        allowExperimentalLineUpdates: IsExperimentalLineUpdateEnabled());
     var updateId = "upd_" + Guid.NewGuid().ToString("N");
     var artifacts = new List<ArtifactData>();
     if (prepared.Status == HotReloadDeltaUpdateStatus.Ready)
@@ -198,6 +200,13 @@ static async Task<object> PrepareUpdateAsync(
         lineUpdatesComplete = prepared.LineUpdatesComplete,
         warnings = prepared.Warnings
     };
+}
+
+static bool IsExperimentalLineUpdateEnabled()
+{
+    var value = Environment.GetEnvironmentVariable("VISION_HOT_RELOAD_EXPERIMENTAL_LINE_UPDATES");
+    return string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+        string.Equals(value, "true", StringComparison.OrdinalIgnoreCase);
 }
 
 static object CommitUpdate(

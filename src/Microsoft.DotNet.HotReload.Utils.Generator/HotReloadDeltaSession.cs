@@ -160,7 +160,8 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     public async Task<HotReloadDeltaPreparedUpdate> PrepareUpdateAsync(
         IReadOnlyList<HotReloadDeltaDocumentChange> changes,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        bool allowExperimentalLineUpdates = false)
     {
         ThrowIfEnded();
         if (pendingSolution is not null)
@@ -177,6 +178,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         var changedFiles = ImmutableArray.CreateBuilder<string>(changes.Count);
         var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(changes.Count);
         var hasTextChanges = false;
+        var hasExperimentalLineUpdates = false;
         foreach (var change in changes)
         {
             var path = Path.GetFullPath(change.FilePath);
@@ -195,7 +197,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
-            if (oldText.Lines.Count != newText.Lines.Count ||
+            var lineCountChanged = oldText.Lines.Count != newText.Lines.Count;
+            if ((lineCountChanged && !allowExperimentalLineUpdates) ||
                 ContainsLineDirective(oldText) ||
                 ContainsLineDirective(newText))
             {
@@ -203,6 +206,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                     changes,
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
             }
+
+            hasExperimentalLineUpdates |= lineCountChanged;
 
             updatedSolution = updatedSolution.WithDocumentText(document.Id, newText);
             changedFiles.Add(path);
@@ -328,8 +333,10 @@ public sealed class HotReloadDeltaSession : IDisposable
             changedDocuments.ToImmutable(),
             update.RequiredCapabilities,
             diagnostics,
-            LineUpdatesComplete: true,
-            []);
+            LineUpdatesComplete: !hasExperimentalLineUpdates,
+            hasExperimentalLineUpdates
+                ? ["Experimental line-moving update emitted a Roslyn PDB delta; the netcoredbg line-map sidecar remains incomplete."]
+                : []);
     }
 
     public void CommitUpdate()

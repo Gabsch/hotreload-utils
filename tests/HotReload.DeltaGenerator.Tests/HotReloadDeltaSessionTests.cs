@@ -78,6 +78,32 @@ public sealed class HotReloadDeltaSessionTests
         Assert.False(session.HasPendingUpdate);
     }
 
+    [Fact]
+    public async Task Session_ExperimentallyEmitsRoslynDeltaForLineMovingEdit()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync(
+            [new(fixture.SourcePath, ProjectFixture.Source(2) + Environment.NewLine)],
+            cancellationToken,
+            allowExperimentalLineUpdates: true);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.NotEmpty(update.PdbDelta);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Contains(update.Warnings, warning => warning.Contains("line-map sidecar", StringComparison.Ordinal));
+        Assert.True(session.HasPendingUpdate);
+        session.DiscardUpdate();
+    }
+
     private sealed class ProjectFixture : IDisposable
     {
         private ProjectFixture(string root)
