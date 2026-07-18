@@ -57,7 +57,7 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
-    public async Task Session_ClassifiesLineMovingEditAsRestartRequired()
+    public async Task Session_EmitsExactSequencePointUpdatesForLineMovingEdit()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
@@ -68,33 +68,16 @@ public sealed class HotReloadDeltaSessionTests
             properties: null,
             runtimeCapabilities: ["Baseline"],
             cancellationToken);
+
+        var first = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.Source(2))
+        ], cancellationToken);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, first.Status);
+        session.CommitUpdate();
 
         var update = await session.PrepareUpdateAsync([
-            new(fixture.SourcePath, ProjectFixture.Source(2) + Environment.NewLine)
+            new(fixture.SourcePath, ProjectFixture.SourceWithLineShift(3))
         ], cancellationToken);
-
-        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
-        Assert.False(update.LineUpdatesComplete);
-        Assert.False(session.HasPendingUpdate);
-    }
-
-    [Fact]
-    public async Task Session_ExperimentallyEmitsRoslynDeltaForLineMovingEdit()
-    {
-        var cancellationToken = TestContext.Current.CancellationToken;
-        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
-        using var session = await HotReloadDeltaSession.StartAsync(
-            fixture.ProjectPath,
-            "Debug",
-            "net10.0",
-            properties: null,
-            runtimeCapabilities: ["Baseline"],
-            cancellationToken);
-
-        var update = await session.PrepareUpdateAsync(
-            [new(fixture.SourcePath, ProjectFixture.Source(2) + Environment.NewLine)],
-            cancellationToken,
-            allowExperimentalLineUpdates: true);
 
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
         Assert.NotEmpty(update.PdbDelta);
@@ -102,7 +85,7 @@ public sealed class HotReloadDeltaSessionTests
         var lineUpdate = Assert.Single(update.LineUpdates);
         Assert.Equal(fixture.SourcePath, lineUpdate.FilePath);
         Assert.Equal(lineUpdate.OldLine + 1, lineUpdate.NewLine);
-        Assert.Contains(update.Warnings, warning => warning.Contains("line-map sidecar", StringComparison.Ordinal));
+        Assert.Contains(update.Warnings, warning => warning.Contains("Exact sequence-point", StringComparison.Ordinal));
         Assert.True(session.HasPendingUpdate);
         session.DiscardUpdate();
     }
@@ -167,8 +150,16 @@ public sealed class HotReloadDeltaSessionTests
             public static class Calculator
             {
                 public static int Value() => {{value}};
+
+                public static int Unchanged() => 10;
             }
             """;
+
+        public static string SourceWithLineShift(int value) =>
+            Source(value).Replace(
+                "    public static int Unchanged()",
+                "    // inserted line\n    public static int Unchanged()",
+                StringComparison.Ordinal);
 
         public void Dispose()
         {

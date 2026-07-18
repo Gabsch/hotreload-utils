@@ -13,6 +13,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
 using Microsoft.CodeAnalysis.Text;
 
@@ -84,18 +85,22 @@ public sealed class HotReloadDeltaSession : IDisposable
     private readonly HotReloadService hotReloadService;
     private Solution solution;
     private readonly ProjectId projectId;
+    private ImmutableArray<byte> baselinePdb;
     private Solution? pendingSolution;
+    private ImmutableArray<byte>? pendingPdb;
     private bool ended;
 
     private HotReloadDeltaSession(
         HotReloadService hotReloadService,
         Solution solution,
         ProjectId projectId,
+        ImmutableArray<byte> baselinePdb,
         HotReloadDeltaSessionInfo info)
     {
         this.hotReloadService = hotReloadService;
         this.solution = solution;
         this.projectId = projectId;
+        this.baselinePdb = baselinePdb;
         Info = info;
     }
 
@@ -163,13 +168,13 @@ public sealed class HotReloadDeltaSession : IDisposable
             artifacts.HotReloadService,
             artifacts.BaselineSolution,
             artifacts.BaselineProjectId,
+            (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray(),
             info);
     }
 
     public async Task<HotReloadDeltaPreparedUpdate> PrepareUpdateAsync(
         IReadOnlyList<HotReloadDeltaDocumentChange> changes,
-        CancellationToken cancellationToken = default,
-        bool allowExperimentalLineUpdates = false)
+        CancellationToken cancellationToken = default)
     {
         ThrowIfEnded();
         if (pendingSolution is not null)
@@ -185,9 +190,8 @@ public sealed class HotReloadDeltaSession : IDisposable
         var updatedSolution = solution;
         var changedFiles = ImmutableArray.CreateBuilder<string>(changes.Count);
         var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(changes.Count);
-        var lineUpdates = ImmutableArray.CreateBuilder<HotReloadDeltaLineUpdate>();
         var hasTextChanges = false;
-        var hasExperimentalLineUpdates = false;
+        var hasLineMovingChanges = false;
         foreach (var change in changes)
         {
             var path = Path.GetFullPath(change.FilePath);
@@ -207,8 +211,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             var lineCountChanged = oldText.Lines.Count != newText.Lines.Count;
-            if ((lineCountChanged && !allowExperimentalLineUpdates) ||
-                ContainsLineDirective(oldText) ||
+            if (ContainsLineDirective(oldText) ||
                 ContainsLineDirective(newText))
             {
                 return RestartRequired(
@@ -216,11 +219,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
             }
 
-            hasExperimentalLineUpdates |= lineCountChanged;
-            if (lineCountChanged)
-            {
-                lineUpdates.Add(CreateLineUpdate(path, oldText, newText));
-            }
+            hasLineMovingChanges |= lineCountChanged;
 
             updatedSolution = updatedSolution.WithDocumentText(document.Id, newText);
             changedFiles.Add(path);
@@ -332,7 +331,32 @@ public sealed class HotReloadDeltaSession : IDisposable
         }
 
         var update = updates.ProjectUpdates[0];
+        var updatedMethods = GetUpdatedMethodTokens(update.MetadataDelta);
+        var fullPdb = await EmitFullPdbAsync(updatedSolution.GetProject(projectId)!, cancellationToken);
+        if (!fullPdb.Success)
+        {
+            hotReloadService.DiscardUpdate();
+            return RestartRequired(changes, fullPdb.Error!);
+        }
+
+        ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
+        if (hasLineMovingChanges)
+        {
+            var mapping = CreateExactLineUpdates(
+                fullPdb.Pdb,
+                changedFiles.ToImmutable(),
+                updatedMethods);
+            if (!mapping.Success)
+            {
+                hotReloadService.DiscardUpdate();
+                return RestartRequired(changes, mapping.Error!);
+            }
+
+            lineUpdates = mapping.LineUpdates;
+        }
+
         pendingSolution = updatedSolution;
+        pendingPdb = fullPdb.Pdb;
         return new(
             HotReloadDeltaUpdateStatus.Ready,
             Info.ModuleName,
@@ -342,16 +366,16 @@ public sealed class HotReloadDeltaSession : IDisposable
             update.ILDelta,
             update.PdbDelta,
             update.UpdatedTypes,
-            GetUpdatedMethodTokens(update.MetadataDelta),
+            updatedMethods,
             changedDocuments.ToImmutable(),
             update.RequiredCapabilities,
             diagnostics,
             LineUpdatesComplete: true,
-            hasExperimentalLineUpdates
-                ? ["Experimental line-moving update emitted a constrained netcoredbg line-map sidecar for one net line-count shift."]
+            hasLineMovingChanges
+                ? ["Exact sequence-point updates were derived from committed and updated portable PDBs for unchanged methods."]
                 : [])
         {
-            LineUpdates = lineUpdates.ToImmutable()
+            LineUpdates = lineUpdates
         };
     }
 
@@ -365,7 +389,9 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         hotReloadService.CommitUpdate();
         solution = pendingSolution;
+        baselinePdb = pendingPdb ?? baselinePdb;
         pendingSolution = null;
+        pendingPdb = null;
     }
 
     public void DiscardUpdate()
@@ -378,6 +404,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         hotReloadService.DiscardUpdate();
         pendingSolution = null;
+        pendingPdb = null;
     }
 
     public void Dispose()
@@ -391,6 +418,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         {
             hotReloadService.DiscardUpdate();
             pendingSolution = null;
+            pendingPdb = null;
         }
 
         hotReloadService.EndSession();
@@ -431,21 +459,128 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static bool ContainsLineDirective(SourceText text) =>
         text.ToString().Contains("#line", StringComparison.Ordinal);
 
-    private static HotReloadDeltaLineUpdate CreateLineUpdate(
-        string filePath,
-        SourceText oldText,
-        SourceText newText)
+    private async Task<FullPdbResult> EmitFullPdbAsync(
+        Project updatedProject,
+        CancellationToken cancellationToken)
     {
-        var commonPrefix = 0;
-        var comparableLineCount = Math.Min(oldText.Lines.Count, newText.Lines.Count);
-        while (commonPrefix < comparableLineCount &&
-            oldText.Lines[commonPrefix].ToString() == newText.Lines[commonPrefix].ToString())
+        var compilation = await updatedProject.GetCompilationAsync(cancellationToken);
+        if (compilation is null)
         {
-            commonPrefix++;
+            return FullPdbResult.Fail("The updated project compilation is unavailable for sequence-point mapping.");
         }
 
-        var lineDelta = newText.Lines.Count - oldText.Lines.Count;
-        return new(filePath, commonPrefix + lineDelta, commonPrefix);
+        using var peStream = new MemoryStream();
+        using var pdbStream = new MemoryStream();
+        var emit = compilation.Emit(
+            peStream,
+            pdbStream,
+            options: new EmitOptions(
+                debugInformationFormat: DebugInformationFormat.PortablePdb,
+                pdbFilePath: Info.PdbPath),
+            cancellationToken: cancellationToken);
+        if (!emit.Success)
+        {
+            var message = string.Join("; ", emit.Diagnostics
+                .Where(static diagnostic => diagnostic.Severity == DiagnosticSeverity.Error)
+                .Select(static diagnostic => diagnostic.GetMessage()));
+            return FullPdbResult.Fail($"The updated portable PDB could not be emitted: {message}");
+        }
+
+        return FullPdbResult.Ok(pdbStream.ToArray().ToImmutableArray());
+    }
+
+    private ExactLineUpdateResult CreateExactLineUpdates(
+        ImmutableArray<byte> updatedPdb,
+        ImmutableArray<string> changedFiles,
+        ImmutableArray<int> updatedMethods)
+    {
+        var changedPaths = changedFiles
+            .Select(Path.GetFullPath)
+            .ToHashSet(PathComparer);
+        var updatedMethodSet = updatedMethods.ToHashSet();
+        var oldPoints = ReadSequencePoints(baselinePdb);
+        var newPoints = ReadSequencePoints(updatedPdb);
+        var mappings = new Dictionary<string, Dictionary<int, int>>(PathComparer);
+
+        foreach (var oldPoint in oldPoints.Values)
+        {
+            if (oldPoint.Hidden ||
+                updatedMethodSet.Contains(oldPoint.MethodToken) ||
+                !changedPaths.Contains(Path.GetFullPath(oldPoint.FilePath)))
+            {
+                continue;
+            }
+
+            if (!newPoints.TryGetValue((oldPoint.MethodToken, oldPoint.IlOffset), out var newPoint) ||
+                newPoint.Hidden ||
+                !PathComparer.Equals(Path.GetFullPath(oldPoint.FilePath), Path.GetFullPath(newPoint.FilePath)))
+            {
+                return ExactLineUpdateResult.Fail(
+                    $"An unchanged sequence point could not be mapped exactly for method 0x{oldPoint.MethodToken:x8} at IL offset {oldPoint.IlOffset}.");
+            }
+
+            if (!mappings.TryGetValue(oldPoint.FilePath, out var fileMappings))
+            {
+                fileMappings = new Dictionary<int, int>();
+                mappings.Add(oldPoint.FilePath, fileMappings);
+            }
+
+            if (fileMappings.TryGetValue(oldPoint.StartLine, out var existingLine) && existingLine != newPoint.StartLine)
+            {
+                return ExactLineUpdateResult.Fail(
+                    $"Source line {oldPoint.StartLine + 1} maps to multiple updated lines in '{oldPoint.FilePath}'.");
+            }
+
+            fileMappings[oldPoint.StartLine] = newPoint.StartLine;
+        }
+
+        var lineUpdates = mappings
+            .Where(static mapping => mapping.Value.Any(static pair => pair.Key != pair.Value))
+            .SelectMany(static mapping => mapping.Value
+                .OrderBy(static pair => pair.Key)
+                .Select(pair => new HotReloadDeltaLineUpdate(mapping.Key, pair.Value, pair.Key)))
+            .ToImmutableArray();
+        if (lineUpdates.IsEmpty)
+        {
+            return ExactLineUpdateResult.Fail(
+                "The source line count changed, but no exact unchanged-method sequence-point mapping was produced.");
+        }
+
+        return ExactLineUpdateResult.Ok(lineUpdates);
+    }
+
+    private static Dictionary<(int MethodToken, int IlOffset), PortableSequencePoint> ReadSequencePoints(
+        ImmutableArray<byte> pdbImage)
+    {
+        using var provider = MetadataReaderProvider.FromPortablePdbImage(pdbImage);
+        var reader = provider.GetMetadataReader();
+        var result = new Dictionary<(int MethodToken, int IlOffset), PortableSequencePoint>();
+        var methodCount = reader.GetTableRowCount(TableIndex.MethodDebugInformation);
+        for (var row = 1; row <= methodCount; row++)
+        {
+            var methodToken = MetadataTokens.GetToken(MetadataTokens.MethodDefinitionHandle(row));
+            var method = reader.GetMethodDebugInformation(MetadataTokens.MethodDebugInformationHandle(row));
+            var defaultDocument = method.Document;
+            foreach (var point in method.GetSequencePoints())
+            {
+                var documentHandle = point.Document.IsNil ? defaultDocument : point.Document;
+                if (documentHandle.IsNil)
+                {
+                    continue;
+                }
+
+                var document = reader.GetDocument(documentHandle);
+                var filePath = reader.GetString(document.Name);
+                result[(methodToken, point.Offset)] = new(
+                    methodToken,
+                    point.Offset,
+                    filePath,
+                    point.StartLine - 1,
+                    point.IsHidden);
+            }
+        }
+
+        return result;
     }
 
     private static string ContentHash(SourceText text) =>
@@ -471,4 +606,37 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static StringComparison PathComparison => OperatingSystem.IsWindows()
         ? StringComparison.OrdinalIgnoreCase
         : StringComparison.Ordinal;
+
+    private static StringComparer PathComparer => OperatingSystem.IsWindows()
+        ? StringComparer.OrdinalIgnoreCase
+        : StringComparer.Ordinal;
+
+    private sealed record PortableSequencePoint(
+        int MethodToken,
+        int IlOffset,
+        string FilePath,
+        int StartLine,
+        bool Hidden);
+
+    private sealed record ExactLineUpdateResult(
+        bool Success,
+        ImmutableArray<HotReloadDeltaLineUpdate> LineUpdates,
+        string? Error)
+    {
+        public static ExactLineUpdateResult Ok(ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates) =>
+            new(true, lineUpdates, null);
+
+        public static ExactLineUpdateResult Fail(string error) =>
+            new(false, [], error);
+    }
+
+    private sealed record FullPdbResult(
+        bool Success,
+        ImmutableArray<byte> Pdb,
+        string? Error)
+    {
+        public static FullPdbResult Ok(ImmutableArray<byte> pdb) => new(true, pdb, null);
+
+        public static FullPdbResult Fail(string error) => new(false, [], error);
+    }
 }
