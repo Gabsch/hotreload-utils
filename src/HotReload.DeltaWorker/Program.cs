@@ -13,7 +13,7 @@ using System.Text.Json.Serialization;
 using System.Threading.Tasks;
 using Microsoft.DotNet.HotReload.Utils.Generator;
 
-const int ProtocolVersion = 1;
+const int ProtocolVersion = 2;
 var protocolOutput = Console.Out;
 Console.SetOut(Console.Error);
 var jsonOptions = new JsonSerializerOptions(JsonSerializerDefaults.Web)
@@ -177,7 +177,10 @@ static async Task<object> PrepareUpdateAsync(
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dmeta", "metadata", prepared.MetadataDelta.AsSpan()));
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dil", "il", prepared.IlDelta.AsSpan()));
         artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dpdb", "pdb", prepared.PdbDelta.AsSpan()));
-        artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dlines", "lineUpdates", [0, 0, 0, 0]));
+        artifacts.Add(WriteLineUpdatesArtifact(
+            artifactDirectory,
+            updateId + ".dlines",
+            prepared.LineUpdates));
         session.PendingUpdateId = updateId;
     }
 
@@ -191,11 +194,49 @@ static async Task<object> PrepareUpdateAsync(
         changedFiles = prepared.ChangedFiles,
         artifacts,
         updatedTypes = prepared.UpdatedTypes,
+        updatedMethods = prepared.UpdatedMethods,
+        changedDocuments = prepared.ChangedDocuments,
         requiredCapabilities = prepared.RequiredCapabilities,
         diagnostics = prepared.Diagnostics,
         lineUpdatesComplete = prepared.LineUpdatesComplete,
         warnings = prepared.Warnings
     };
+}
+
+static ArtifactData WriteLineUpdatesArtifact(
+    string artifactDirectory,
+    string fileName,
+    IReadOnlyList<HotReloadDeltaLineUpdate> updates)
+{
+    var path = Path.Combine(artifactDirectory, fileName);
+    var groupedUpdates = updates
+        .GroupBy(update => update.FilePath, StringComparer.Ordinal)
+        .ToArray();
+    using (var stream = File.Create(path))
+    using (var writer = new BinaryWriter(stream))
+    {
+        writer.Write(groupedUpdates.Length);
+        foreach (var group in groupedUpdates)
+        {
+            var pathBytes = System.Text.Encoding.UTF8.GetBytes(group.Key);
+            writer.Write(pathBytes.Length);
+            writer.Write(pathBytes);
+            var entries = group.ToArray();
+            writer.Write(entries.Length);
+            foreach (var update in entries)
+            {
+                writer.Write(update.NewLine);
+                writer.Write(update.OldLine);
+            }
+        }
+    }
+
+    var content = File.ReadAllBytes(path);
+    return new(
+        "lineUpdates",
+        path,
+        content.Length,
+        Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant());
 }
 
 static object CommitUpdate(
