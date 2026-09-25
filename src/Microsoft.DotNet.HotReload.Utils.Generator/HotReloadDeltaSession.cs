@@ -13,6 +13,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
 using Microsoft.CodeAnalysis.Text;
@@ -340,12 +342,16 @@ public sealed class HotReloadDeltaSession : IDisposable
         }
 
         ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
+        var includesUpdatedMethodMappings = false;
         if (hasLineMovingChanges)
         {
-            var mapping = CreateExactLineUpdates(
+            var mapping = await CreateExactLineUpdatesAsync(
+                solution.GetProject(projectId)!,
+                updatedSolution.GetProject(projectId)!,
                 fullPdb.Pdb,
                 changedFiles.ToImmutable(),
-                updatedMethods);
+                updatedMethods,
+                cancellationToken);
             if (!mapping.Success)
             {
                 hotReloadService.DiscardUpdate();
@@ -353,6 +359,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             lineUpdates = mapping.LineUpdates;
+            includesUpdatedMethodMappings = mapping.IncludesUpdatedMethods;
         }
 
         pendingSolution = updatedSolution;
@@ -372,7 +379,9 @@ public sealed class HotReloadDeltaSession : IDisposable
             diagnostics,
             LineUpdatesComplete: true,
             hasLineMovingChanges
-                ? ["Exact sequence-point updates were derived from committed and updated portable PDBs for unchanged methods."]
+                ? [includesUpdatedMethodMappings
+                    ? "Exact sequence-point updates were derived from committed and updated source/PDB evidence, including updated methods."
+                    : "Exact sequence-point updates were derived from committed and updated portable PDBs for unchanged methods."]
                 : [])
         {
             LineUpdates = lineUpdates
@@ -489,10 +498,13 @@ public sealed class HotReloadDeltaSession : IDisposable
         return FullPdbResult.Ok(pdbStream.ToArray().ToImmutableArray());
     }
 
-    private ExactLineUpdateResult CreateExactLineUpdates(
+    private async Task<ExactLineUpdateResult> CreateExactLineUpdatesAsync(
+        Project committedProject,
+        Project updatedProject,
         ImmutableArray<byte> updatedPdb,
         ImmutableArray<string> changedFiles,
-        ImmutableArray<int> updatedMethods)
+        ImmutableArray<int> updatedMethods,
+        CancellationToken cancellationToken)
     {
         var changedPaths = changedFiles
             .Select(Path.GetFullPath)
@@ -501,42 +513,73 @@ public sealed class HotReloadDeltaSession : IDisposable
         var oldPoints = ReadSequencePoints(baselinePdb);
         var newPoints = ReadSequencePoints(updatedPdb);
         var mappings = new Dictionary<string, Dictionary<int, int>>(PathComparer);
+        var reverseMappings = new Dictionary<string, Dictionary<int, int>>(PathComparer);
+        var includesUpdatedMethods = false;
+        var committedDocuments = await ReadSyntaxDocumentsAsync(
+            committedProject,
+            changedPaths,
+            cancellationToken);
+        var updatedDocuments = await ReadSyntaxDocumentsAsync(
+            updatedProject,
+            changedPaths,
+            cancellationToken);
 
-        foreach (var oldPoint in oldPoints.Values)
+        foreach (var methodGroup in oldPoints
+            .Where(point => !point.Hidden && changedPaths.Contains(Path.GetFullPath(point.FilePath)))
+            .GroupBy(point => point.MethodToken))
         {
-            if (oldPoint.Hidden ||
-                updatedMethodSet.Contains(oldPoint.MethodToken) ||
-                !changedPaths.Contains(Path.GetFullPath(oldPoint.FilePath)))
+            if (updatedMethodSet.Contains(methodGroup.Key))
             {
+                includesUpdatedMethods = true;
+                var updatedMapping = MapUpdatedMethod(
+                    methodGroup.OrderBy(point => point.IlOffset).ToImmutableArray(),
+                    newPoints
+                        .Where(point => !point.Hidden && point.MethodToken == methodGroup.Key)
+                        .OrderBy(point => point.IlOffset)
+                        .ToImmutableArray(),
+                    committedDocuments,
+                    updatedDocuments);
+                if (!updatedMapping.Success)
+                {
+                    return ExactLineUpdateResult.Fail(updatedMapping.Error!);
+                }
+
+                foreach (var pair in updatedMapping.Points)
+                {
+                    var addResult = AddLineMapping(mappings, reverseMappings, pair.Old, pair.New);
+                    if (addResult is not null)
+                    {
+                        return ExactLineUpdateResult.Fail(addResult);
+                    }
+                }
+
                 continue;
             }
 
-            if (!newPoints.TryGetValue((oldPoint.MethodToken, oldPoint.IlOffset), out var newPoint) ||
-                newPoint.Hidden ||
-                !PathComparer.Equals(Path.GetFullPath(oldPoint.FilePath), Path.GetFullPath(newPoint.FilePath)))
+            foreach (var oldPoint in methodGroup)
             {
-                return ExactLineUpdateResult.Fail(
-                    $"An unchanged sequence point could not be mapped exactly for method 0x{oldPoint.MethodToken:x8} at IL offset {oldPoint.IlOffset}.");
-            }
+                var matches = newPoints.Where(point =>
+                    !point.Hidden &&
+                    point.MethodToken == oldPoint.MethodToken &&
+                    point.IlOffset == oldPoint.IlOffset &&
+                    PathComparer.Equals(Path.GetFullPath(oldPoint.FilePath), Path.GetFullPath(point.FilePath))).ToArray();
+                if (matches.Length != 1)
+                {
+                    return ExactLineUpdateResult.Fail(
+                        $"An unchanged sequence point could not be mapped exactly for method 0x{oldPoint.MethodToken:x8} at IL offset {oldPoint.IlOffset}.");
+                }
 
-            if (!mappings.TryGetValue(oldPoint.FilePath, out var fileMappings))
-            {
-                fileMappings = new Dictionary<int, int>();
-                mappings.Add(oldPoint.FilePath, fileMappings);
+                var addResult = AddLineMapping(mappings, reverseMappings, oldPoint, matches[0]);
+                if (addResult is not null)
+                {
+                    return ExactLineUpdateResult.Fail(addResult);
+                }
             }
-
-            if (fileMappings.TryGetValue(oldPoint.StartLine, out var existingLine) && existingLine != newPoint.StartLine)
-            {
-                return ExactLineUpdateResult.Fail(
-                    $"Source line {oldPoint.StartLine + 1} maps to multiple updated lines in '{oldPoint.FilePath}'.");
-            }
-
-            fileMappings[oldPoint.StartLine] = newPoint.StartLine;
         }
 
         var lineUpdates = mappings
-            .Where(static mapping => mapping.Value.Any(static pair => pair.Key != pair.Value))
             .SelectMany(static mapping => mapping.Value
+                .Where(static pair => pair.Key != pair.Value)
                 .OrderBy(static pair => pair.Key)
                 .Select(pair => new HotReloadDeltaLineUpdate(mapping.Key, pair.Value, pair.Key)))
             .ToImmutableArray();
@@ -546,15 +589,202 @@ public sealed class HotReloadDeltaSession : IDisposable
                 "The source line count changed, but no exact unchanged-method sequence-point mapping was produced.");
         }
 
-        return ExactLineUpdateResult.Ok(lineUpdates);
+        return ExactLineUpdateResult.Ok(lineUpdates, includesUpdatedMethods);
     }
 
-    private static Dictionary<(int MethodToken, int IlOffset), PortableSequencePoint> ReadSequencePoints(
+    private static async Task<Dictionary<string, DocumentSyntaxSnapshot>> ReadSyntaxDocumentsAsync(
+        Project project,
+        HashSet<string> changedPaths,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, DocumentSyntaxSnapshot>(PathComparer);
+        foreach (var document in project.Documents)
+        {
+            if (document.FilePath is null)
+            {
+                continue;
+            }
+
+            var path = Path.GetFullPath(document.FilePath);
+            if (!changedPaths.Contains(path))
+            {
+                continue;
+            }
+
+            var root = await document.GetSyntaxRootAsync(cancellationToken);
+            var text = await document.GetTextAsync(cancellationToken);
+            if (root is null)
+            {
+                throw new InvalidOperationException($"The syntax root is unavailable for '{path}'.");
+            }
+
+            result.Add(path, new(root, text));
+        }
+
+        return result;
+    }
+
+    private static UpdatedMethodMappingResult MapUpdatedMethod(
+        ImmutableArray<PortableSequencePoint> oldPoints,
+        ImmutableArray<PortableSequencePoint> newPoints,
+        Dictionary<string, DocumentSyntaxSnapshot> committedDocuments,
+        Dictionary<string, DocumentSyntaxSnapshot> updatedDocuments)
+    {
+        if (oldPoints.IsEmpty)
+        {
+            return UpdatedMethodMappingResult.Ok([]);
+        }
+
+        var methodToken = oldPoints[0].MethodToken;
+        var oldAnchors = oldPoints.Select(point => CreateSyntaxAnchor(point, committedDocuments)).ToArray();
+        var newAnchors = newPoints.Select(point => CreateSyntaxAnchor(point, updatedDocuments)).ToArray();
+        var exactPairs = ImmutableArray.CreateBuilder<SequencePointPair>(oldPoints.Length);
+        var syntaxMappingComplete = oldAnchors.All(anchor => anchor is not null);
+        if (syntaxMappingComplete)
+        {
+            for (var index = 0; index < oldPoints.Length; index++)
+            {
+                var anchor = oldAnchors[index]!;
+                if (oldAnchors.Count(candidate => candidate == anchor) != 1)
+                {
+                    syntaxMappingComplete = false;
+                    break;
+                }
+
+                var matches = newAnchors
+                    .Select((candidate, candidateIndex) => (candidate, candidateIndex))
+                    .Where(item => item.candidate == anchor)
+                    .Select(item => item.candidateIndex)
+                    .ToArray();
+                if (matches.Length != 1)
+                {
+                    syntaxMappingComplete = false;
+                    break;
+                }
+
+                exactPairs.Add(new(oldPoints[index], newPoints[matches[0]]));
+            }
+        }
+
+        if (syntaxMappingComplete)
+        {
+            return UpdatedMethodMappingResult.Ok(exactPairs.ToImmutable());
+        }
+
+        if (HasEqualVisibleSequencePointStructure(oldPoints, newPoints, oldAnchors, newAnchors))
+        {
+            return UpdatedMethodMappingResult.Ok(oldPoints
+                .Select((point, index) => new SequencePointPair(point, newPoints[index]))
+                .ToImmutableArray());
+        }
+
+        return UpdatedMethodMappingResult.Fail(
+            $"Updated method 0x{methodToken:x8} changed its visible sequence-point structure and does not have a complete unique syntax mapping.");
+    }
+
+    private static bool HasEqualVisibleSequencePointStructure(
+        ImmutableArray<PortableSequencePoint> oldPoints,
+        ImmutableArray<PortableSequencePoint> newPoints,
+        SyntaxAnchor?[] oldAnchors,
+        SyntaxAnchor?[] newAnchors)
+    {
+        if (oldPoints.Length != newPoints.Length)
+        {
+            return false;
+        }
+
+        for (var index = 0; index < oldPoints.Length; index++)
+        {
+            if (!PathComparer.Equals(oldPoints[index].FilePath, newPoints[index].FilePath) ||
+                oldPoints[index].StartColumn != newPoints[index].StartColumn ||
+                oldPoints[index].EndLine - oldPoints[index].StartLine != newPoints[index].EndLine - newPoints[index].StartLine ||
+                oldAnchors[index]?.Kind != newAnchors[index]?.Kind)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static SyntaxAnchor? CreateSyntaxAnchor(
+        PortableSequencePoint point,
+        Dictionary<string, DocumentSyntaxSnapshot> documents)
+    {
+        if (!documents.TryGetValue(Path.GetFullPath(point.FilePath), out var document) ||
+            point.StartLine < 0 ||
+            point.StartLine >= document.Text.Lines.Count)
+        {
+            return null;
+        }
+
+        var line = document.Text.Lines[point.StartLine];
+        var position = Math.Clamp(line.Start + Math.Max(point.StartColumn - 1, 0), line.Start, line.End);
+        var token = document.Root.FindToken(position);
+        var method = token.Parent?.AncestorsAndSelf().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
+        if (method?.Body is not null)
+        {
+            if (token == method.Body.OpenBraceToken)
+            {
+                return new("MethodOpenBrace", "{");
+            }
+
+            if (token == method.Body.CloseBraceToken)
+            {
+                return new("MethodCloseBrace", "}");
+            }
+        }
+
+        var syntax = token.Parent?.AncestorsAndSelf().FirstOrDefault(static node =>
+            node is StatementSyntax or ArrowExpressionClauseSyntax);
+        return syntax is null
+            ? null
+            : new(syntax.Kind().ToString(), NormalizeSyntax(syntax));
+    }
+
+    private static string NormalizeSyntax(SyntaxNode syntax) =>
+        string.Concat(syntax.WithoutTrivia().ToFullString().Where(static character => !char.IsWhiteSpace(character)));
+
+    private static string? AddLineMapping(
+        Dictionary<string, Dictionary<int, int>> mappings,
+        Dictionary<string, Dictionary<int, int>> reverseMappings,
+        PortableSequencePoint oldPoint,
+        PortableSequencePoint newPoint)
+    {
+        if (!PathComparer.Equals(Path.GetFullPath(oldPoint.FilePath), Path.GetFullPath(newPoint.FilePath)))
+        {
+            return $"Sequence point in updated method 0x{oldPoint.MethodToken:x8} moved to another document.";
+        }
+
+        if (!mappings.TryGetValue(oldPoint.FilePath, out var fileMappings))
+        {
+            fileMappings = new Dictionary<int, int>();
+            mappings.Add(oldPoint.FilePath, fileMappings);
+            reverseMappings.Add(oldPoint.FilePath, new Dictionary<int, int>());
+        }
+
+        var fileReverseMappings = reverseMappings[oldPoint.FilePath];
+        if (fileMappings.TryGetValue(oldPoint.StartLine, out var existingNewLine) && existingNewLine != newPoint.StartLine)
+        {
+            return $"Source line {oldPoint.StartLine + 1} maps to multiple updated lines in '{oldPoint.FilePath}'.";
+        }
+
+        if (fileReverseMappings.TryGetValue(newPoint.StartLine, out var existingOldLine) && existingOldLine != oldPoint.StartLine)
+        {
+            return $"Updated line {newPoint.StartLine + 1} maps from multiple source lines in '{oldPoint.FilePath}'.";
+        }
+
+        fileMappings[oldPoint.StartLine] = newPoint.StartLine;
+        fileReverseMappings[newPoint.StartLine] = oldPoint.StartLine;
+        return null;
+    }
+
+    private static ImmutableArray<PortableSequencePoint> ReadSequencePoints(
         ImmutableArray<byte> pdbImage)
     {
         using var provider = MetadataReaderProvider.FromPortablePdbImage(pdbImage);
         var reader = provider.GetMetadataReader();
-        var result = new Dictionary<(int MethodToken, int IlOffset), PortableSequencePoint>();
+        var result = ImmutableArray.CreateBuilder<PortableSequencePoint>();
         var methodCount = reader.GetTableRowCount(TableIndex.MethodDebugInformation);
         for (var row = 1; row <= methodCount; row++)
         {
@@ -571,16 +801,19 @@ public sealed class HotReloadDeltaSession : IDisposable
 
                 var document = reader.GetDocument(documentHandle);
                 var filePath = reader.GetString(document.Name);
-                result[(methodToken, point.Offset)] = new(
+                result.Add(new(
                     methodToken,
                     point.Offset,
                     filePath,
                     point.StartLine - 1,
-                    point.IsHidden);
+                    point.StartColumn,
+                    point.EndLine - 1,
+                    point.EndColumn,
+                    point.IsHidden));
             }
         }
 
-        return result;
+        return result.ToImmutable();
     }
 
     private static string ContentHash(SourceText text) =>
@@ -616,18 +849,42 @@ public sealed class HotReloadDeltaSession : IDisposable
         int IlOffset,
         string FilePath,
         int StartLine,
+        int StartColumn,
+        int EndLine,
+        int EndColumn,
         bool Hidden);
+
+    private sealed record DocumentSyntaxSnapshot(SyntaxNode Root, SourceText Text);
+
+    private sealed record SyntaxAnchor(string Kind, string Text);
+
+    private sealed record SequencePointPair(PortableSequencePoint Old, PortableSequencePoint New);
+
+    private sealed record UpdatedMethodMappingResult(
+        bool Success,
+        ImmutableArray<SequencePointPair> Points,
+        string? Error)
+    {
+        public static UpdatedMethodMappingResult Ok(ImmutableArray<SequencePointPair> points) =>
+            new(true, points, null);
+
+        public static UpdatedMethodMappingResult Fail(string error) =>
+            new(false, [], error);
+    }
 
     private sealed record ExactLineUpdateResult(
         bool Success,
         ImmutableArray<HotReloadDeltaLineUpdate> LineUpdates,
+        bool IncludesUpdatedMethods,
         string? Error)
     {
-        public static ExactLineUpdateResult Ok(ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates) =>
-            new(true, lineUpdates, null);
+        public static ExactLineUpdateResult Ok(
+            ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates,
+            bool includesUpdatedMethods) =>
+            new(true, lineUpdates, includesUpdatedMethods, null);
 
         public static ExactLineUpdateResult Fail(string error) =>
-            new(false, [], error);
+            new(false, [], false, error);
     }
 
     private sealed record FullPdbResult(
