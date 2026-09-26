@@ -65,10 +65,18 @@ internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotRelo
         // the document is really needed for the first time (when building a delta),
         // at which point it may have already been changed on disk to a newer version.
         var t = Task.Run (async () => {
-            foreach (var doc in project.Documents) {
+            foreach (var doc in project.Documents.Concat<TextDocument>(project.AdditionalDocuments)) {
                 await doc.GetTextAsync();
                 if (ct.IsCancellationRequested)
                     break;
+            }
+
+            if (!ct.IsCancellationRequested) {
+                foreach (var doc in await project.GetSourceGeneratedDocumentsAsync(ct)) {
+                    await doc.GetTextAsync(ct);
+                    if (ct.IsCancellationRequested)
+                        break;
+                }
             }
         }, ct);
         if (!ConsumeBaseline (project, out string? outputAsm))
