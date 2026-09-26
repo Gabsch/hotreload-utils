@@ -198,8 +198,16 @@ public sealed class HotReloadDeltaSession : IDisposable
         {
             var path = Path.GetFullPath(change.FilePath);
             var project = updatedSolution.GetProject(projectId)!;
-            var document = project.Documents.SingleOrDefault(candidate =>
+            TextDocument? document = project.Documents.SingleOrDefault(candidate =>
                 string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison));
+            var isAdditionalDocument = false;
+            if (document is null)
+            {
+                document = project.AdditionalDocuments.SingleOrDefault(candidate =>
+                    string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison));
+                isAdditionalDocument = document is not null;
+            }
+
             if (document is null)
             {
                 return RestartRequired(changes, $"Document is not part of the baseline project: {path}");
@@ -223,7 +231,9 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             hasLineMovingChanges |= lineCountChanged;
 
-            updatedSolution = updatedSolution.WithDocumentText(document.Id, newText);
+            updatedSolution = isAdditionalDocument
+                ? updatedSolution.WithAdditionalDocumentText(document.Id, newText)
+                : updatedSolution.WithDocumentText(document.Id, newText);
             changedFiles.Add(path);
             changedDocuments.Add(new(
                 path,

@@ -158,12 +158,14 @@ static async Task<object> PrepareUpdateAsync(
     var changes = request.ChangedDocuments.Select(document =>
     {
         var filePath = Path.GetFullPath(document.FilePath);
+        var extension = Path.GetExtension(filePath);
         if (!IsUnderRoot(session.WorkspaceRoot, filePath) ||
-            !string.Equals(Path.GetExtension(filePath), ".cs", StringComparison.OrdinalIgnoreCase))
+            !string.Equals(extension, ".cs", StringComparison.OrdinalIgnoreCase) &&
+            !string.Equals(extension, ".razor", StringComparison.OrdinalIgnoreCase))
         {
             throw new WorkerException(
                 "hot_reload_document_invalid",
-                $"Changed document is outside the workspace or is not C#: {document.FilePath}");
+                $"Changed document is outside the workspace or is not C# or Razor: {document.FilePath}");
         }
 
         return new HotReloadDeltaDocumentChange(filePath, document.Text);

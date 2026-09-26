@@ -14,6 +14,37 @@ namespace HotReload.DeltaGenerator.Tests;
 public sealed class HotReloadDeltaSessionTests
 {
     [Fact]
+    public async Task Session_ProducesDeltaForLineStableRazorComponentEdit()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await RazorProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, RazorProjectFixture.UpdatedSource)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.NotEmpty(update.MetadataDelta);
+        Assert.NotEmpty(update.IlDelta);
+        Assert.NotEmpty(update.PdbDelta);
+        Assert.NotEmpty(update.UpdatedTypes);
+        Assert.NotEmpty(update.UpdatedMethods);
+        var changedDocument = Assert.Single(update.ChangedDocuments);
+        Assert.Equal(fixture.ComponentPath, changedDocument.FilePath);
+        Assert.NotEqual(changedDocument.BaselineSha256, changedDocument.UpdatedSha256);
+        Assert.True(update.LineUpdatesComplete);
+        Assert.True(session.HasPendingUpdate);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_PreparesDiscardsRegeneratesAndCommitsLineStableUpdates()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -174,6 +205,99 @@ public sealed class HotReloadDeltaSessionTests
 
     private static int FindLine(string source, string text) =>
         Array.FindIndex(source.Split('\n'), line => line.Contains(text, StringComparison.Ordinal));
+
+    private sealed class RazorProjectFixture : IDisposable
+    {
+        private RazorProjectFixture(string root)
+        {
+            Root = root;
+            ProjectPath = Path.Combine(root, "RazorDeltaFixture.csproj");
+            ComponentPath = Path.Combine(root, "Counter.razor");
+        }
+
+        public string Root { get; }
+
+        public string ProjectPath { get; }
+
+        public string ComponentPath { get; }
+
+        public const string BaselineSource = """
+            @namespace RazorDeltaFixture
+            <h1>Counter step: 2</h1>
+            <p role="status">Value: @value</p>
+            <button @onclick="Increment">Increment</button>
+            @code {
+                private int value;
+                private void Increment() => value += 2;
+            }
+            """;
+
+        public const string UpdatedSource = """
+            @namespace RazorDeltaFixture
+            <h1>Counter step: 3</h1>
+            <p role="status">Updated value: @value</p>
+            <button @onclick="Increment">Add three</button>
+            @code {
+                private int value;
+                private void Increment() => value += 3;
+            }
+            """;
+
+        public static async Task<RazorProjectFixture> CreateAsync(CancellationToken cancellationToken)
+        {
+            var root = Path.Combine(Path.GetTempPath(), "hotreload-razor-delta-tests", Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(root);
+            var fixture = new RazorProjectFixture(root);
+            await File.WriteAllTextAsync(fixture.ProjectPath, """
+                <Project Sdk="Microsoft.NET.Sdk.Razor">
+                  <PropertyGroup>
+                    <TargetFramework>net10.0</TargetFramework>
+                    <DebugType>portable</DebugType>
+                    <Optimize>false</Optimize>
+                    <RazorLangVersion>10.0</RazorLangVersion>
+                  </PropertyGroup>
+                  <ItemGroup>
+                    <FrameworkReference Include="Microsoft.AspNetCore.App" />
+                  </ItemGroup>
+                </Project>
+                """, cancellationToken);
+            await File.WriteAllTextAsync(fixture.ComponentPath, BaselineSource, cancellationToken);
+
+            var startInfo = new ProcessStartInfo
+            {
+                FileName = "dotnet",
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                WorkingDirectory = root
+            };
+            startInfo.ArgumentList.Add("build");
+            startInfo.ArgumentList.Add(fixture.ProjectPath);
+            startInfo.ArgumentList.Add("--nologo");
+            using var process = Process.Start(startInfo)!;
+            await process.WaitForExitAsync(cancellationToken);
+            if (process.ExitCode != 0)
+            {
+                var output = await process.StandardOutput.ReadToEndAsync();
+                var error = await process.StandardError.ReadToEndAsync();
+                fixture.Dispose();
+                throw new InvalidOperationException($"Razor fixture build failed: {output}{error}");
+            }
+
+            return fixture;
+        }
+
+        public void Dispose()
+        {
+            try
+            {
+                Directory.Delete(Root, recursive: true);
+            }
+            catch (Exception)
+            {
+            }
+        }
+    }
 
     private sealed class ProjectFixture : IDisposable
     {
