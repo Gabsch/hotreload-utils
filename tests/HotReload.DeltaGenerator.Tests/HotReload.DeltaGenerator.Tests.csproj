@@ -11,6 +11,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Microsoft.DotNet.HotReload.Utils.Generator\Microsoft.DotNet.HotReload.Utils.Generator.csproj" />
+    <ProjectReference Include="..\..\src\HotReload.DeltaWorker\HotReload.DeltaWorker.csproj" ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

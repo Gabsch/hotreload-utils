@@ -175,15 +175,52 @@ static async Task<object> PrepareUpdateAsync(
     var artifacts = new List<ArtifactData>();
     if (prepared.Status == HotReloadDeltaUpdateStatus.Ready)
     {
-        Directory.CreateDirectory(artifactDirectory);
-        artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dmeta", "metadata", prepared.MetadataDelta.AsSpan()));
-        artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dil", "il", prepared.IlDelta.AsSpan()));
-        artifacts.Add(WriteArtifact(artifactDirectory, updateId + ".dpdb", "pdb", prepared.PdbDelta.AsSpan()));
-        artifacts.Add(WriteLineUpdatesArtifact(
-            artifactDirectory,
-            updateId + ".dlines",
-            prepared.LineUpdates));
-        session.PendingUpdateId = updateId;
+        var artifactNames = new[]
+        {
+            updateId + ".dmeta",
+            updateId + ".dil",
+            updateId + ".dpdb",
+            updateId + ".dlines"
+        };
+        try
+        {
+            Directory.CreateDirectory(artifactDirectory);
+            artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[0], "metadata", prepared.MetadataDelta.AsSpan()));
+            artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[1], "il", prepared.IlDelta.AsSpan()));
+            artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[2], "pdb", prepared.PdbDelta.AsSpan()));
+            artifacts.Add(WriteLineUpdatesArtifact(
+                artifactDirectory,
+                artifactNames[3],
+                prepared.LineUpdates));
+            session.PendingUpdateId = updateId;
+        }
+        catch (Exception artifactFailure)
+        {
+            Exception? discardFailure = null;
+            try
+            {
+                session.Session.DiscardUpdate();
+            }
+            catch (Exception exception)
+            {
+                discardFailure = exception;
+            }
+
+            foreach (var artifactName in artifactNames)
+            {
+                DeleteArtifactBestEffort(Path.Combine(artifactDirectory, artifactName));
+            }
+
+            if (discardFailure is not null)
+            {
+                throw new AggregateException(
+                    "Artifact generation failed and the staged Hot Reload update could not be discarded.",
+                    artifactFailure,
+                    discardFailure);
+            }
+
+            throw;
+        }
     }
 
     return new
@@ -328,6 +365,20 @@ static ArtifactData WriteArtifact(
         path,
         content.Length,
         Convert.ToHexString(SHA256.HashData(content)).ToLowerInvariant());
+}
+
+static void DeleteArtifactBestEffort(string path)
+{
+    try
+    {
+        File.Delete(path);
+    }
+    catch (IOException)
+    {
+    }
+    catch (UnauthorizedAccessException)
+    {
+    }
 }
 
 static Guid ReadModuleId(string assemblyPath)

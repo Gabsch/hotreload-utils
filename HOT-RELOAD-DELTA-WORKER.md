@@ -8,10 +8,12 @@ around the official Roslyn Hot Reload generator. The worker keeps preview Roslyn
 assemblies out of the consuming process and preserves explicit prepare, commit,
 discard, and end-session behavior.
 
-Protocol v1 supports existing C# document edits in one emitting project. It emits
-metadata, IL, and portable PDB deltas. Until Roslyn's ExternalAccess wrapper
-exposes sequence-point line updates, edits that change line counts or `#line`
-mappings are classified as restart-required.
+Protocol v2 supports existing C# and Razor document edits in one emitting
+project. It emits metadata, IL, portable PDB, and exact `.dlines`
+sequence-point-correlation artifacts. Line-moving edits are accepted only when
+the worker can prove a complete, unambiguous mapping from committed and updated
+source/PDB evidence. Ambiguous mappings, `#line` directives, and unsupported
+document changes are classified as restart-required before a delta is exposed.
 
 The original CLI and generator behavior remain available. The worker does not treat
 the experimental CLI as its production boundary.

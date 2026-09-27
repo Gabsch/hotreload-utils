@@ -15,6 +15,14 @@ $publishRoot = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     [IO.Path]::GetFullPath($OutputPath)
 }
 $forkCommit = (git -C $repositoryRoot rev-parse HEAD).Trim()
+$versionsPath = Join-Path $repositoryRoot "eng\Versions.props"
+[xml]$versions = Get-Content -LiteralPath $versionsPath -Raw
+$roslynVersion = [string]$versions.Project.PropertyGroup.MicrosoftCodeAnalysisVersion
+$msBuildVersion = [string]$versions.Project.PropertyGroup.MicrosoftBuildVersion
+if ([string]::IsNullOrWhiteSpace($roslynVersion) -or
+    [string]::IsNullOrWhiteSpace($msBuildVersion)) {
+    throw "eng/Versions.props must define MicrosoftCodeAnalysisVersion and MicrosoftBuildVersion."
+}
 
 if (Test-Path -LiteralPath $publishRoot) {
     Remove-Item -LiteralPath $publishRoot -Recurse -Force
@@ -39,8 +47,8 @@ Repository: https://github.com/Gabsch/hotreload-utils
 Fork commit: $forkCommit
 Upstream repository: https://github.com/dotnet/hotreload-utils
 Upstream commit: $UpstreamCommit
-Roslyn version: 5.6.0-2.26178.1
-MSBuild version: 17.11.48
+Roslyn version: $roslynVersion
+MSBuild version: $msBuildVersion
 License: MIT
 "@ | Set-Content -LiteralPath (Join-Path $publishRoot "PROVENANCE.txt") -Encoding UTF8
 

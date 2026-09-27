@@ -4,6 +4,8 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Reflection;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.DotNet.HotReload.Utils.Generator;
@@ -201,6 +203,169 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Empty(update.LineUpdates);
         Assert.False(session.HasPendingUpdate);
         Assert.Contains(update.Warnings, warning => warning.Contains("updated method", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Worker_DiscardsPreparedUpdateWhenArtifactWritingFails()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var worker = StartWorker();
+        var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            var started = await SendWorkerRequestAsync(
+                worker,
+                "start",
+                "startSession",
+                new
+                {
+                    projectPath = fixture.ProjectPath,
+                    workspaceRoot = fixture.Root,
+                    configuration = "Debug",
+                    targetFramework = "net10.0",
+                    msBuildProperties = (object?)null,
+                    runtimeCapabilities = new[] { "Baseline" }
+                },
+                cancellationToken);
+            Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+            var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+            var blockedArtifactDirectory = Path.Combine(fixture.Root, "artifact-blocker");
+            await File.WriteAllTextAsync(blockedArtifactDirectory, "not a directory", cancellationToken);
+
+            var failed = await SendWorkerRequestAsync(
+                worker,
+                "prepare-failure",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                    },
+                    artifactDirectory = blockedArtifactDirectory
+                },
+                cancellationToken);
+            Assert.False(failed.GetProperty("success").GetBoolean());
+            Assert.Equal(
+                "hot_reload_worker_error",
+                failed.GetProperty("error").GetProperty("code").GetString());
+
+            var recovered = await SendWorkerRequestAsync(
+                worker,
+                "prepare-recovered",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                    },
+                    artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                },
+                cancellationToken);
+            Assert.True(recovered.GetProperty("success").GetBoolean(), recovered.ToString());
+            var result = recovered.GetProperty("result");
+            Assert.Equal("ready", result.GetProperty("status").GetString());
+            var updateId = result.GetProperty("updateId").GetString()!;
+
+            var discarded = await SendWorkerRequestAsync(
+                worker,
+                "discard",
+                "discardUpdate",
+                new { sessionId, updateId },
+                cancellationToken);
+            Assert.True(discarded.GetProperty("success").GetBoolean(), discarded.ToString());
+
+            var ended = await SendWorkerRequestAsync(
+                worker,
+                "end",
+                "endSession",
+                new { sessionId },
+                cancellationToken);
+            Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+            worker.StandardInput.Close();
+            await worker.WaitForExitAsync(cancellationToken);
+            Assert.True(worker.ExitCode == 0, await stderr);
+        }
+        finally
+        {
+            if (!worker.HasExited)
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
+    private static Process StartWorker()
+    {
+        var repositoryRoot = FindRepositoryRoot();
+        var configuration = typeof(HotReloadDeltaSessionTests).Assembly
+            .GetCustomAttribute<AssemblyConfigurationAttribute>()?
+            .Configuration ?? "Debug";
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            WorkingDirectory = repositoryRoot
+        };
+        startInfo.ArgumentList.Add("run");
+        startInfo.ArgumentList.Add("--project");
+        startInfo.ArgumentList.Add(Path.Combine(
+            repositoryRoot,
+            "src",
+            "HotReload.DeltaWorker",
+            "HotReload.DeltaWorker.csproj"));
+        startInfo.ArgumentList.Add("--no-build");
+        startInfo.ArgumentList.Add("--configuration");
+        startInfo.ArgumentList.Add(configuration);
+        startInfo.ArgumentList.Add("--framework");
+        startInfo.ArgumentList.Add("net10.0");
+        return Process.Start(startInfo)!;
+    }
+
+    private static async Task<JsonElement> SendWorkerRequestAsync(
+        Process worker,
+        string id,
+        string method,
+        object parameters,
+        CancellationToken cancellationToken)
+    {
+        var request = JsonSerializer.Serialize(new
+        {
+            protocolVersion = 2,
+            id,
+            method,
+            parameters
+        });
+        await worker.StandardInput.WriteLineAsync(request.AsMemory(), cancellationToken);
+        await worker.StandardInput.FlushAsync(cancellationToken);
+        var response = await worker.StandardOutput.ReadLineAsync(cancellationToken);
+        Assert.False(string.IsNullOrWhiteSpace(response));
+        using var document = JsonDocument.Parse(response);
+        return document.RootElement.Clone();
+    }
+
+    private static string FindRepositoryRoot()
+    {
+        for (var directory = new DirectoryInfo(AppContext.BaseDirectory);
+            directory is not null;
+            directory = directory.Parent)
+        {
+            if (File.Exists(Path.Combine(directory.FullName, "HotReloadUtils.slnx")))
+            {
+                return directory.FullName;
+            }
+        }
+
+        throw new DirectoryNotFoundException("Could not locate the hotreload-utils repository root.");
     }
 
     private static int FindLine(string source, string text) =>
