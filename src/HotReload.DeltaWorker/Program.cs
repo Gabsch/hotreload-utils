@@ -148,12 +148,7 @@ static async Task<object> PrepareUpdateAsync(
     }
 
     var artifactDirectory = Path.GetFullPath(request.ArtifactDirectory);
-    if (!IsUnderRoot(session.WorkspaceRoot, artifactDirectory))
-    {
-        throw new WorkerException(
-            "hot_reload_path_outside_workspace",
-            "artifactDirectory must be under workspaceRoot.");
-    }
+    EnsureArtifactPathUnderWorkspace(session.WorkspaceRoot, artifactDirectory);
 
     var changes = request.ChangedDocuments.Select(document =>
     {
@@ -185,6 +180,7 @@ static async Task<object> PrepareUpdateAsync(
         try
         {
             Directory.CreateDirectory(artifactDirectory);
+            EnsureArtifactPathUnderWorkspace(session.WorkspaceRoot, artifactDirectory);
             artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[0], "metadata", prepared.MetadataDelta.AsSpan()));
             artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[1], "il", prepared.IlDelta.AsSpan()));
             artifacts.Add(WriteArtifact(artifactDirectory, artifactNames[2], "pdb", prepared.PdbDelta.AsSpan()));
@@ -395,6 +391,46 @@ static bool IsUnderRoot(string root, string path)
     return Path.GetFullPath(path).StartsWith(
         normalizedRoot,
         OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+}
+
+static void EnsureArtifactPathUnderWorkspace(string workspaceRoot, string artifactDirectory)
+{
+    var resolvedRoot = ResolvePathThroughExistingLinks(workspaceRoot);
+    var resolvedArtifactDirectory = ResolvePathThroughExistingLinks(artifactDirectory);
+    if (!IsUnderRoot(resolvedRoot, resolvedArtifactDirectory))
+    {
+        throw new WorkerException(
+            "hot_reload_path_outside_workspace",
+            "artifactDirectory must resolve under workspaceRoot.");
+    }
+}
+
+static string ResolvePathThroughExistingLinks(string path)
+{
+    var fullPath = Path.GetFullPath(path);
+    var root = Path.GetPathRoot(fullPath)
+        ?? throw new InvalidOperationException($"Path does not have a filesystem root: {path}");
+    var current = root;
+    foreach (var segment in fullPath[root.Length..].Split(
+        [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+        StringSplitOptions.RemoveEmptyEntries))
+    {
+        var candidate = Path.Combine(current, segment);
+        FileSystemInfo? info = Directory.Exists(candidate)
+            ? new DirectoryInfo(candidate)
+            : File.Exists(candidate)
+                ? new FileInfo(candidate)
+                : null;
+        if (info is null)
+        {
+            current = candidate;
+            continue;
+        }
+
+        current = Path.GetFullPath(info.ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? info.FullName);
+    }
+
+    return current;
 }
 
 internal sealed record WorkerRequest(

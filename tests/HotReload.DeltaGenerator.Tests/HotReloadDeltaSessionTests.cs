@@ -124,6 +124,33 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_DetectsLineMovementWhenTotalLineCountIsUnchanged()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = ProjectFixture.BalancedLineShiftBaseline(2);
+        var updated = ProjectFixture.BalancedLineShiftUpdated(3);
+        using var fixture = await ProjectFixture.CreateAsync(baseline, cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, updated)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.Contains(update.LineUpdates, lineUpdate =>
+            lineUpdate.OldLine == FindLine(baseline, "public static int Unchanged()") &&
+            lineUpdate.NewLine == FindLine(updated, "public static int Unchanged()"));
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_EmitsExactSequencePointUpdatesForUpdatedMethodLineMove()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -203,6 +230,32 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Empty(update.LineUpdates);
         Assert.False(session.HasPendingUpdate);
         Assert.Contains(update.Warnings, warning => warning.Contains("updated method", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Session_RejectsAmbiguousOrdinalUpdatedMethodMapping()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.AmbiguousMappingSource(1, 2),
+            cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.AmbiguousMappingSourceWithShiftedReorder(3, 4))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Empty(update.MetadataDelta);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning => warning.Contains("ambiguous", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]
@@ -297,6 +350,103 @@ public sealed class HotReloadDeltaSessionTests
             {
                 worker.Kill(entireProcessTree: true);
                 await worker.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Worker_RejectsArtifactDirectoryThatEscapesWorkspaceThroughSymbolicLink()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        var outsideRoot = Path.Combine(
+            Path.GetTempPath(),
+            "hotreload-delta-generator-tests-outside",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(outsideRoot);
+        var linkPath = Path.Combine(fixture.Root, "artifact-link");
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(linkPath, outsideRoot);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+            {
+                Assert.Skip($"Symbolic links are unavailable in this test environment: {exception.Message}");
+                return;
+            }
+
+            using var worker = StartWorker();
+            var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+            try
+            {
+                var started = await SendWorkerRequestAsync(
+                    worker,
+                    "start",
+                    "startSession",
+                    new
+                    {
+                        projectPath = fixture.ProjectPath,
+                        workspaceRoot = fixture.Root,
+                        configuration = "Debug",
+                        targetFramework = "net10.0",
+                        msBuildProperties = (object?)null,
+                        runtimeCapabilities = new[] { "Baseline" }
+                    },
+                    cancellationToken);
+                Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+                var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+
+                var rejected = await SendWorkerRequestAsync(
+                    worker,
+                    "prepare",
+                    "prepareUpdate",
+                    new
+                    {
+                        sessionId,
+                        changedDocuments = new[]
+                        {
+                            new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                        },
+                        artifactDirectory = Path.Combine(linkPath, "artifacts")
+                    },
+                    cancellationToken);
+                Assert.False(rejected.GetProperty("success").GetBoolean());
+                Assert.Equal(
+                    "hot_reload_path_outside_workspace",
+                    rejected.GetProperty("error").GetProperty("code").GetString());
+                Assert.Empty(Directory.EnumerateFileSystemEntries(outsideRoot));
+
+                var ended = await SendWorkerRequestAsync(
+                    worker,
+                    "end",
+                    "endSession",
+                    new { sessionId },
+                    cancellationToken);
+                Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+                worker.StandardInput.Close();
+                await worker.WaitForExitAsync(cancellationToken);
+                Assert.True(worker.ExitCode == 0, await stderr);
+            }
+            finally
+            {
+                if (!worker.HasExited)
+                {
+                    worker.Kill(entireProcessTree: true);
+                    await worker.WaitForExitAsync(CancellationToken.None);
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                Directory.Delete(outsideRoot, recursive: true);
+            }
+            catch
+            {
             }
         }
     }
@@ -540,6 +690,18 @@ public sealed class HotReloadDeltaSessionTests
                 "    // inserted line\n    public static int Unchanged()",
                 StringComparison.Ordinal);
 
+        public static string BalancedLineShiftBaseline(int value) =>
+            Source(value).Replace(
+                "    public static int Unchanged() => 10;",
+                "    public static int Unchanged() => 10;\n    // removable line",
+                StringComparison.Ordinal);
+
+        public static string BalancedLineShiftUpdated(int value) =>
+            Source(value).Replace(
+                "    public static int Unchanged()",
+                "    // inserted line\n    public static int Unchanged()",
+                StringComparison.Ordinal);
+
         public static string ActiveSource(int value) => $$"""
             namespace DeltaFixture;
 
@@ -580,6 +742,35 @@ public sealed class HotReloadDeltaSessionTests
                 .Replace(line + "\r\n", string.Empty, StringComparison.Ordinal)
                 .Replace(line + "\n", string.Empty, StringComparison.Ordinal);
         }
+
+        public static string AmbiguousMappingSource(int first, int second) => $$"""
+            namespace DeltaFixture;
+
+            public static class Calculator
+            {
+                public static int Run(int input)
+                {
+                    var first = input + {{first}};
+                    var second = input + {{second}};
+                    return first + second;
+                }
+            }
+            """;
+
+        public static string AmbiguousMappingSourceWithShiftedReorder(int first, int second) => $$"""
+            namespace DeltaFixture;
+
+            public static class Calculator
+            {
+                public static int Run(int input)
+                {
+                    // inserted line
+                    var second = input + {{second}};
+                    var first = input + {{first}};
+                    return first + second;
+                }
+            }
+            """;
 
         public void Dispose()
         {
