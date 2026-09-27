@@ -34,3 +34,13 @@ dotnet test tests\HotReload.DeltaGenerator.Tests\HotReload.DeltaGenerator.Tests.
 
 The build script writes a complete framework-dependent, DLL-only worker payload
 under `artifacts\delta-worker` with the MIT license and provenance record included.
+
+## Known follow-up: embedded baseline symbols
+
+Protocol v2 currently requires the debuggee baseline to expose a standalone
+portable PDB through its CodeView entry or as the assembly's sibling `.pdb`.
+Assemblies built with `DebugType=embedded` are rejected as unsupported baseline
+input. Supporting them requires a baseline-symbol-source abstraction that can
+retain embedded and external portable PDB images through the same session
+lifecycle; that capability is intentionally deferred to a follow-up rather than
+being represented as partial support in this worker contract.

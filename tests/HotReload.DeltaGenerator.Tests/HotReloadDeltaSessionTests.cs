@@ -148,6 +148,38 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_AdvancesSourceSnapshotWhenRoslynProducesNoDelta()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+        var commentOnlySource = ProjectFixture.Source(1) + "\n// comment-only update\n";
+
+        var noDelta = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, commentOnlySource)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.NoChanges, noDelta.Status);
+        Assert.False(session.HasPendingUpdate);
+
+        var next = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.Source(2) + "\n// comment-only update\n")
+        ], cancellationToken);
+        var changedDocument = Assert.Single(next.ChangedDocuments);
+        Assert.Equal(
+            Convert.ToHexString(SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(commentOnlySource))).ToLowerInvariant(),
+            changedDocument.BaselineSha256);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, next.Status);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_AllowsTrailingCommentWithoutSequencePointMovement()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -537,6 +569,41 @@ public sealed class HotReloadDeltaSessionTests
         Assert.True(DetectLineMovement(baseline, updated));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Session_DetectsMovedArrowExpressionsWithinStableDeclarations(bool property)
+    {
+        var baseline = ProjectFixture.ShiftedArrowExpressionSource(property, updated: false);
+        var updated = ProjectFixture.ShiftedArrowExpressionSource(property, updated: true);
+
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.True(DetectLineMovement(baseline, updated));
+    }
+
+    [Fact]
+    public async Task Session_DistinguishesFunctionPointerCallingConventionsInTokenIdentities()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.FunctionPointerOverloadSource(1, 2, reverse: false),
+            cancellationToken);
+        var assemblyPath = Path.Combine(fixture.Root, "bin", "Debug", "net10.0", "DeltaFixture.dll");
+        var reader = typeof(HotReloadDeltaSession).GetMethod(
+            "ReadMethodTokenIdentities",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var identities = (Dictionary<int, string>)reader.Invoke(null, [
+            (await File.ReadAllBytesAsync(assemblyPath, cancellationToken)).ToImmutableArray()
+        ])!;
+        var overloads = identities.Values
+            .Where(identity => identity.Contains("::M`0", StringComparison.Ordinal))
+            .ToArray();
+
+        Assert.Equal(2, overloads.Length);
+        Assert.All(overloads, identity => Assert.Contains("fnptr[header=", identity, StringComparison.Ordinal));
+        Assert.NotEqual(overloads[0], overloads[1]);
+    }
+
     [Fact]
     public async Task Session_DetectsReorderedChangedExpressionStatements()
     {
@@ -606,6 +673,26 @@ public sealed class HotReloadDeltaSessionTests
             ProjectFixture.Source(1),
             cancellationToken,
             debugType: "none");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken));
+
+        Directory.Delete(fixture.Root, recursive: true);
+        Assert.False(Directory.Exists(fixture.Root));
+    }
+
+    [Fact]
+    public async Task Session_ReleasesWorkspaceWhenBaselineAssemblyIsMissing()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        var assemblyPath = Path.Combine(fixture.Root, "bin", "Debug", "net10.0", "DeltaFixture.dll");
+        File.Delete(assemblyPath);
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => HotReloadDeltaSession.StartAsync(
             fixture.ProjectPath,
@@ -1316,6 +1403,7 @@ public sealed class HotReloadDeltaSessionTests
                     <TargetFramework>net10.0</TargetFramework>
                     <DebugType>{{debugType}}</DebugType>
                     <Optimize>false</Optimize>
+                    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
                     {{pdbProperty}}
                   </PropertyGroup>
                 </Project>
@@ -1550,6 +1638,42 @@ public sealed class HotReloadDeltaSessionTests
 
                     private static int F(int value) => value;
                     private static int G(int value) => value;
+                }
+                """;
+        }
+
+        public static string ShiftedArrowExpressionSource(bool property, bool updated)
+        {
+            var member = (property, updated) switch
+            {
+                (true, false) => "    public static int Value => F(1);\n    // movable comment",
+                (true, true) => "    public static int Value =>\n        F(2);",
+                (false, false) => "    public static int Value() => F(1);\n    // movable comment",
+                _ => "    public static int Value() =>\n        F(2);"
+            };
+            return $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                {{member}}
+                    public static int Unchanged => 10;
+                    private static int F(int value) => value;
+                }
+                """;
+        }
+
+        public static string FunctionPointerOverloadSource(int first, int second, bool reverse)
+        {
+            var managed = $"    public static int M(delegate* managed<void> callback) => {first};";
+            var unmanaged = $"    public static int M(delegate* unmanaged<void> callback) => {second};";
+            var methods = reverse ? unmanaged + "\n" + managed : managed + "\n" + unmanaged;
+            return $$"""
+                namespace DeltaFixture;
+
+                public static unsafe class Calculator
+                {
+                {{methods}}
                 }
                 """;
         }

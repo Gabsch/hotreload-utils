@@ -378,6 +378,11 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         if (updates.Status == HotReloadService.Status.NoChangesToApply || updates.ProjectUpdates.IsEmpty)
         {
+            // Roslyn deliberately creates no pending update for NoChangesToApply, so there is
+            // nothing to commit or discard. Advance only our source snapshot so later hashes and
+            // edits are based on the text Roslyn just evaluated.
+            solution = updatedSolution;
+
             return new(
                 HotReloadDeltaUpdateStatus.NoChanges,
                 Info.ModuleName,
@@ -659,6 +664,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 BaseMethodDeclarationSyntax method => "method:" + MethodIdentity(method),
                 BasePropertyDeclarationSyntax property => "property:" + PropertyIdentity(property),
                 AccessorDeclarationSyntax accessor => "accessor:" + AccessorIdentity(accessor),
+                ArrowExpressionClauseSyntax arrow => "arrow:" + ArrowExpressionIdentity(arrow),
                 LocalFunctionStatementSyntax localFunction => "local-function:" + LocalFunctionIdentity(localFunction),
                 LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
                 BaseFieldDeclarationSyntax field => "field:" + FieldIdentity(field),
@@ -676,7 +682,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 result.Add(identity, positions);
             }
 
-            positions.Add(tree.GetLineSpan(node.Span).StartLinePosition.Line);
+            var positionNode = node is ArrowExpressionClauseSyntax arrowClause ? arrowClause.Expression : node;
+            positions.Add(tree.GetLineSpan(positionNode.Span).StartLinePosition.Line);
         }
 
         return result;
@@ -739,6 +746,15 @@ public sealed class HotReloadDeltaSession : IDisposable
         var property = accessor.Ancestors().OfType<BasePropertyDeclarationSyntax>().FirstOrDefault();
         return $"{(property is null ? ContainingTypeIdentity(accessor) : PropertyIdentity(property))}:{accessor.Kind()}";
     }
+
+    private static string ArrowExpressionIdentity(ArrowExpressionClauseSyntax arrow) => arrow.Parent switch
+    {
+        BaseMethodDeclarationSyntax method => MethodIdentity(method),
+        BasePropertyDeclarationSyntax property => PropertyIdentity(property),
+        AccessorDeclarationSyntax accessor => AccessorIdentity(accessor),
+        LocalFunctionStatementSyntax localFunction => LocalFunctionIdentity(localFunction),
+        _ => ContainingExecutableIdentity(arrow)
+    };
 
     private static string ContainingExecutableIdentity(SyntaxNode node)
     {
@@ -1349,7 +1365,8 @@ public sealed class HotReloadDeltaSession : IDisposable
         public string GetByReferenceType(string elementType) => $"{elementType}&";
 
         public string GetFunctionPointerType(MethodSignature<string> signature) =>
-            $"fnptr({string.Join(",", signature.ParameterTypes)})->{signature.ReturnType}";
+            $"fnptr[header={signature.Header.RawValue};generic={signature.GenericParameterCount};required={signature.RequiredParameterCount}]" +
+            $"({string.Join(",", signature.ParameterTypes)})->{signature.ReturnType}";
 
         public string GetGenericInstantiation(string genericType, ImmutableArray<string> typeArguments) =>
             $"{genericType}<{string.Join(",", typeArguments)}>";
