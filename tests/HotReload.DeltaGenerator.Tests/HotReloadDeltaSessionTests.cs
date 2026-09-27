@@ -9,6 +9,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Reflection.Metadata;
+using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
@@ -170,6 +171,32 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsDuplicateDocumentChangesWithoutStagingAnUpdate()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.SourceWithLineShift(2)),
+            new(Path.Combine(fixture.Root, ".", Path.GetFileName(fixture.SourcePath)), ProjectFixture.Source(2))
+        ], cancellationToken));
+
+        Assert.False(session.HasPendingUpdate);
+        var recovered = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.Source(2))
+        ], cancellationToken);
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, recovered.Status);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_EmitsExactSequencePointUpdatesForLineMovingEdit()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -200,6 +227,34 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Equal(lineUpdate.OldLine + 1, lineUpdate.NewLine);
         Assert.Contains(update.Warnings, warning => warning.Contains("Exact sequence-point", StringComparison.Ordinal));
         Assert.True(session.HasPendingUpdate);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_MapsOnlyDocumentsThatActuallyMoveLines()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.Source(1),
+            cancellationToken,
+            additionalSource: ProjectFixture.SecondaryActiveSource(2));
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.SourceWithLineShift(2)),
+            new(fixture.SecondaryPath, ProjectFixture.SecondaryActiveSourceWithoutSeed(3))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.NotEmpty(update.LineUpdates);
+        Assert.All(update.LineUpdates, lineUpdate => Assert.Equal(fixture.SourcePath, lineUpdate.FilePath));
+        Assert.Contains(fixture.SecondaryPath, update.ChangedFiles);
         session.DiscardUpdate();
     }
 
@@ -465,16 +520,21 @@ public sealed class HotReloadDeltaSessionTests
     {
         var baseline = ProjectFixture.ReorderedFieldInitializersSource(1, 2, reverse: false);
         var updated = ProjectFixture.ReorderedFieldInitializersSource(3, 4, reverse: true);
-        var detector = typeof(HotReloadDeltaSession).GetMethod(
-            "HasLineMovingChanges",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-        var lineMovementDetected = (bool)detector.Invoke(null, [
-            SourceText.From(baseline),
-            SourceText.From(updated)
-        ])!;
 
         Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
-        Assert.True(lineMovementDetected);
+        Assert.True(DetectLineMovement(baseline, updated));
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Session_DetectsReorderedChangedPropertiesAsLineMovement(bool expressionBodied)
+    {
+        var baseline = ProjectFixture.ReorderedPropertiesSource(1, 2, reverse: false, expressionBodied);
+        var updated = ProjectFixture.ReorderedPropertiesSource(3, 4, reverse: true, expressionBodied);
+
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.True(DetectLineMovement(baseline, updated));
     }
 
     [Fact]
@@ -557,6 +617,32 @@ public sealed class HotReloadDeltaSessionTests
 
         Directory.Delete(fixture.Root, recursive: true);
         Assert.False(Directory.Exists(fixture.Root));
+    }
+
+    [Fact]
+    public async Task Session_CapturesModuleIdWithTheBaselineImage()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+        Guid expectedModuleId;
+        using (var stream = File.OpenRead(session.Info.OutputAssemblyPath))
+        using (var peReader = new PEReader(stream))
+        {
+            var metadata = peReader.GetMetadataReader();
+            expectedModuleId = metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
+        }
+
+        File.Delete(session.Info.OutputAssemblyPath);
+
+        Assert.NotEqual(Guid.Empty, session.Info.ModuleId);
+        Assert.Equal(expectedModuleId, session.Info.ModuleId);
     }
 
     [Fact]
@@ -661,6 +747,103 @@ public sealed class HotReloadDeltaSessionTests
             var result = recovered.GetProperty("result");
             Assert.Equal("ready", result.GetProperty("status").GetString());
             var updateId = result.GetProperty("updateId").GetString()!;
+
+            var discarded = await SendWorkerRequestAsync(
+                worker,
+                "discard",
+                "discardUpdate",
+                new { sessionId, updateId },
+                cancellationToken);
+            Assert.True(discarded.GetProperty("success").GetBoolean(), discarded.ToString());
+
+            var ended = await SendWorkerRequestAsync(
+                worker,
+                "end",
+                "endSession",
+                new { sessionId },
+                cancellationToken);
+            Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+            worker.StandardInput.Close();
+            await worker.WaitForExitAsync(cancellationToken);
+            Assert.True(worker.ExitCode == 0, await stderr);
+        }
+        finally
+        {
+            if (!worker.HasExited)
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Worker_RejectsDuplicateDocumentsAndKeepsSessionUsable()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var worker = StartWorker();
+        var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            var started = await SendWorkerRequestAsync(
+                worker,
+                "start",
+                "startSession",
+                new
+                {
+                    projectPath = fixture.ProjectPath,
+                    workspaceRoot = fixture.Root,
+                    configuration = "Debug",
+                    targetFramework = "net10.0",
+                    msBuildProperties = (object?)null,
+                    runtimeCapabilities = new[] { "Baseline" }
+                },
+                cancellationToken);
+            Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+            var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+
+            var rejected = await SendWorkerRequestAsync(
+                worker,
+                "duplicate",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = fixture.SourcePath, text = ProjectFixture.SourceWithLineShift(2) },
+                        new
+                        {
+                            filePath = Path.Combine(fixture.Root, ".", Path.GetFileName(fixture.SourcePath)),
+                            text = ProjectFixture.Source(2)
+                        }
+                    },
+                    artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                },
+                cancellationToken);
+            Assert.False(rejected.GetProperty("success").GetBoolean());
+            Assert.Equal(
+                "hot_reload_invalid_request",
+                rejected.GetProperty("error").GetProperty("code").GetString());
+
+            var recovered = await SendWorkerRequestAsync(
+                worker,
+                "prepare",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                    },
+                    artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                },
+                cancellationToken);
+            Assert.True(recovered.GetProperty("success").GetBoolean(), recovered.ToString());
+            var updateId = recovered.GetProperty("result").GetProperty("updateId").GetString()!;
 
             var discarded = await SendWorkerRequestAsync(
                 worker,
@@ -986,6 +1169,17 @@ public sealed class HotReloadDeltaSessionTests
     private static int FindLine(string source, string text) =>
         Array.FindIndex(source.Split('\n'), line => line.Contains(text, StringComparison.Ordinal));
 
+    private static bool DetectLineMovement(string baseline, string updated)
+    {
+        var detector = typeof(HotReloadDeltaSession).GetMethod(
+            "HasLineMovingChanges",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        return (bool)detector.Invoke(null, [
+            SourceText.From(baseline),
+            SourceText.From(updated)
+        ])!;
+    }
+
     private sealed class RazorProjectFixture : IDisposable
     {
         private RazorProjectFixture(string root)
@@ -1088,6 +1282,7 @@ public sealed class HotReloadDeltaSessionTests
             Root = root;
             ProjectPath = Path.Combine(root, "DeltaFixture.csproj");
             SourcePath = Path.Combine(root, "Calculator.cs");
+            SecondaryPath = Path.Combine(root, "Secondary.cs");
         }
 
         public string Root { get; }
@@ -1095,6 +1290,8 @@ public sealed class HotReloadDeltaSessionTests
         public string ProjectPath { get; }
 
         public string SourcePath { get; }
+
+        public string SecondaryPath { get; }
 
         public static Task<ProjectFixture> CreateAsync(CancellationToken cancellationToken) =>
             CreateAsync(Source(1), cancellationToken);
@@ -1104,7 +1301,8 @@ public sealed class HotReloadDeltaSessionTests
             CancellationToken cancellationToken,
             string? pdbFile = null,
             string? buildPathMapTarget = null,
-            string debugType = "portable")
+            string debugType = "portable",
+            string? additionalSource = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-delta-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -1123,6 +1321,10 @@ public sealed class HotReloadDeltaSessionTests
                 </Project>
                 """, cancellationToken);
             await File.WriteAllTextAsync(fixture.SourcePath, initialSource, cancellationToken);
+            if (additionalSource is not null)
+            {
+                await File.WriteAllTextAsync(fixture.SecondaryPath, additionalSource, cancellationToken);
+            }
             var startInfo = new ProcessStartInfo
             {
                 FileName = "dotnet",
@@ -1323,6 +1525,53 @@ public sealed class HotReloadDeltaSessionTests
                 }
                 """;
         }
+
+        public static string ReorderedPropertiesSource(
+            int first,
+            int second,
+            bool reverse,
+            bool expressionBodied)
+        {
+            var firstProperty = expressionBodied
+                ? $"    public static int A => F({first});"
+                : $"    public static int A {{ get; }} = F({first});";
+            var secondProperty = expressionBodied
+                ? $"    public static int B => G({second});"
+                : $"    public static int B {{ get; }} = G({second});";
+            var properties = reverse
+                ? secondProperty + "\n" + firstProperty
+                : firstProperty + "\n" + secondProperty;
+            return $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                {{properties}}
+
+                    private static int F(int value) => value;
+                    private static int G(int value) => value;
+                }
+                """;
+        }
+
+        public static string SecondaryActiveSource(int value) => $$"""
+            namespace DeltaFixture;
+
+            public static class Secondary
+            {
+                public static int Run(int input)
+                {
+                    var seed = input + 1;
+                    return input * {{value}};
+                }
+            }
+            """;
+
+        public static string SecondaryActiveSourceWithoutSeed(int value) =>
+            SecondaryActiveSource(value).Replace(
+                "        var seed = input + 1;",
+                "        // seed removed",
+                StringComparison.Ordinal);
 
         public static string ReorderedExpressionStatementsSource(int first, int second, bool reverseCalls)
         {

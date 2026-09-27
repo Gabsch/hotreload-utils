@@ -46,7 +46,10 @@ public sealed record HotReloadDeltaSessionInfo(
     string? TargetFramework,
     string OutputAssemblyPath,
     string PdbPath,
-    string ModuleName);
+    string ModuleName)
+{
+    public Guid ModuleId { get; init; }
+}
 
 public sealed record HotReloadDeltaDocumentChange(string FilePath, string Text);
 
@@ -172,26 +175,31 @@ public sealed class HotReloadDeltaSession : IDisposable
         var outputAssembly = Path.GetFullPath(artifacts.BaselineOutputAsmPath);
         try
         {
-            var pdbPath = FindPortablePdbPath(outputAssembly);
+            var baselinePe = (await File.ReadAllBytesAsync(outputAssembly, cancellationToken)).ToImmutableArray();
+            var pdbPath = FindPortablePdbPath(outputAssembly, baselinePe);
             if (!File.Exists(pdbPath))
             {
                 throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
             }
 
+            var baselinePdb = (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray();
             var info = new HotReloadDeltaSessionInfo(
                 builder.ProjectPath,
                 configuration,
                 targetFramework,
                 outputAssembly,
                 pdbPath,
-                Path.GetFileName(outputAssembly));
+                Path.GetFileName(outputAssembly))
+            {
+                ModuleId = ReadModuleId(baselinePe)
+            };
             return new HotReloadDeltaSession(
                 artifacts.HotReloadService,
                 artifacts.Workspace,
                 artifacts.BaselineSolution,
                 artifacts.BaselineProjectId,
-                (await File.ReadAllBytesAsync(outputAssembly, cancellationToken)).ToImmutableArray(),
-                (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray(),
+                baselinePe,
+                baselinePdb,
                 info);
         }
         catch
@@ -223,14 +231,29 @@ public sealed class HotReloadDeltaSession : IDisposable
             throw new ArgumentException("At least one changed document is required.", nameof(changes));
         }
 
-        var updatedSolution = solution;
-        var changedFiles = ImmutableArray.CreateBuilder<string>(changes.Count);
-        var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(changes.Count);
-        var hasTextChanges = false;
-        var hasLineMovingChanges = false;
+        var normalizedChanges = new List<HotReloadDeltaDocumentChange>(changes.Count);
+        var changedPaths = new HashSet<string>(PathComparer);
         foreach (var change in changes)
         {
             var path = Path.GetFullPath(change.FilePath);
+            if (!changedPaths.Add(path))
+            {
+                throw new ArgumentException(
+                    $"A document may appear only once in an update: {path}",
+                    nameof(changes));
+            }
+
+            normalizedChanges.Add(new(path, change.Text));
+        }
+
+        var updatedSolution = solution;
+        var changedFiles = ImmutableArray.CreateBuilder<string>(normalizedChanges.Count);
+        var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(normalizedChanges.Count);
+        var lineMovingFiles = new HashSet<string>(PathComparer);
+        var hasTextChanges = false;
+        foreach (var change in normalizedChanges)
+        {
+            var path = change.FilePath;
             var project = updatedSolution.GetProject(projectId)!;
             TextDocument? document = project.Documents.SingleOrDefault(candidate =>
                 string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison));
@@ -244,7 +267,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             if (document is null)
             {
-                return RestartRequired(changes, $"Document is not part of the baseline project: {path}");
+                return RestartRequired(normalizedChanges, $"Document is not part of the baseline project: {path}");
             }
 
             var oldText = await document.GetTextAsync(cancellationToken);
@@ -258,11 +281,14 @@ public sealed class HotReloadDeltaSession : IDisposable
                 (ContainsLineDirective(oldText) || ContainsLineDirective(newText)))
             {
                 return RestartRequired(
-                    changes,
+                    normalizedChanges,
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
             }
 
-            hasLineMovingChanges |= HasLineMovingChanges(oldText, newText);
+            if (HasLineMovingChanges(oldText, newText))
+            {
+                lineMovingFiles.Add(path);
+            }
 
             updatedSolution = isAdditionalDocument
                 ? updatedSolution.WithAdditionalDocumentText(document.Id, newText)
@@ -372,7 +398,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         if (updates.ProjectUpdates.Length != 1 || updates.ProjectUpdates[0].ProjectId != projectId)
         {
             hotReloadService.DiscardUpdate();
-            return RestartRequired(changes, "Hot Reload delta v1 supports exactly one emitting project per update.");
+            return RestartRequired(normalizedChanges, "Hot Reload delta v1 supports exactly one emitting project per update.");
         }
 
         try
@@ -383,31 +409,31 @@ public sealed class HotReloadDeltaSession : IDisposable
             if (!fullPdb.Success)
             {
                 hotReloadService.DiscardUpdate();
-                return RestartRequired(changes, fullPdb.Error!);
+                return RestartRequired(normalizedChanges, fullPdb.Error!);
             }
 
             var tokenValidation = ValidateMethodTokenIdentity(baselinePe, fullPdb.Pe);
             if (tokenValidation is not null)
             {
                 hotReloadService.DiscardUpdate();
-                return RestartRequired(changes, tokenValidation);
+                return RestartRequired(normalizedChanges, tokenValidation);
             }
 
             ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
             var includesUpdatedMethodMappings = false;
-            if (hasLineMovingChanges)
+            if (lineMovingFiles.Count > 0)
             {
                 var mapping = await CreateExactLineUpdatesAsync(
                     solution.GetProject(projectId)!,
                     updatedSolution.GetProject(projectId)!,
                     fullPdb.Pdb,
-                    changedFiles.ToImmutable(),
+                    lineMovingFiles.ToImmutableArray(),
                     updatedMethods,
                     cancellationToken);
                 if (!mapping.Success)
                 {
                     hotReloadService.DiscardUpdate();
-                    return RestartRequired(changes, mapping.Error!);
+                    return RestartRequired(normalizedChanges, mapping.Error!);
                 }
 
                 lineUpdates = mapping.LineUpdates;
@@ -431,7 +457,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 update.RequiredCapabilities,
                 diagnostics,
                 LineUpdatesComplete: true,
-                hasLineMovingChanges
+                lineMovingFiles.Count > 0
                     ? [includesUpdatedMethodMappings
                         ? "Exact sequence-point updates were derived from committed and updated source/PDB evidence, including updated methods."
                         : "Exact sequence-point updates were derived from committed and updated portable PDBs for unchanged methods."]
@@ -630,9 +656,12 @@ public sealed class HotReloadDeltaSession : IDisposable
         {
             string? identity = node switch
             {
-                MethodDeclarationSyntax method => "method:" + MethodIdentity(method),
+                BaseMethodDeclarationSyntax method => "method:" + MethodIdentity(method),
+                BasePropertyDeclarationSyntax property => "property:" + PropertyIdentity(property),
+                AccessorDeclarationSyntax accessor => "accessor:" + AccessorIdentity(accessor),
+                LocalFunctionStatementSyntax localFunction => "local-function:" + LocalFunctionIdentity(localFunction),
                 LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
-                FieldDeclarationSyntax field => "field:" + FieldIdentity(field),
+                BaseFieldDeclarationSyntax field => "field:" + FieldIdentity(field),
                 StatementSyntax statement => "statement:" + StatementIdentity(statement),
                 _ => null
             };
@@ -653,48 +682,96 @@ public sealed class HotReloadDeltaSession : IDisposable
         return result;
     }
 
-    private static string MethodIdentity(MethodDeclarationSyntax method)
+    private static string MethodIdentity(BaseMethodDeclarationSyntax method)
     {
-        var containingTypes = method.Ancestors()
-            .OfType<TypeDeclarationSyntax>()
-            .Reverse()
-            .Select(static type => type.Identifier.ValueText);
-        var parameters = method.ParameterList.Parameters.Select(static parameter =>
-            $"{parameter.Modifiers}:{parameter.Type?.WithoutTrivia()}");
-        return $"{string.Join(".", containingTypes)}::{method.Identifier.ValueText}({string.Join(",", parameters)})";
+        var name = method switch
+        {
+            MethodDeclarationSyntax declaration =>
+                $"{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}`{declaration.TypeParameterList?.Parameters.Count ?? 0}",
+            ConstructorDeclarationSyntax => ".ctor",
+            DestructorDeclarationSyntax => ".dtor",
+            OperatorDeclarationSyntax declaration => $"operator {declaration.OperatorToken.ValueText}",
+            ConversionOperatorDeclarationSyntax declaration =>
+                $"{declaration.ImplicitOrExplicitKeyword.ValueText} operator {declaration.Type.WithoutTrivia()}",
+            _ => method.Kind().ToString()
+        };
+        return $"{ContainingTypeIdentity(method)}::{name}({ParameterIdentity(method.ParameterList?.Parameters ?? [])})";
     }
 
     private static string LocalIdentity(LocalDeclarationStatementSyntax local)
     {
-        var method = local.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
         var variables = string.Join(",", local.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
-        return $"{(method is null ? string.Empty : MethodIdentity(method))}:{local.Declaration.Type.WithoutTrivia()}:{variables}";
+        return $"{ContainingExecutableIdentity(local)}:{local.Declaration.Type.WithoutTrivia()}:{variables}";
     }
+
+    private static string LocalFunctionIdentity(LocalFunctionStatementSyntax localFunction) =>
+        $"{ContainingExecutableIdentity(localFunction)}::{localFunction.Identifier.ValueText}`{localFunction.TypeParameterList?.Parameters.Count ?? 0}" +
+        $"({ParameterIdentity(localFunction.ParameterList.Parameters)})";
 
     private static string StatementIdentity(StatementSyntax statement)
     {
-        var method = statement.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
         var tokens = statement.DescendantTokens().Select(static token =>
             token.Parent is LiteralExpressionSyntax
                 ? $"<{token.Kind()}>"
                 : token.ValueText);
-        return $"{(method is null ? string.Empty : MethodIdentity(method))}:{statement.Kind()}:{string.Join("|", tokens)}";
+        return $"{ContainingExecutableIdentity(statement)}:{statement.Kind()}:{string.Join("|", tokens)}";
     }
 
-    private static string FieldIdentity(FieldDeclarationSyntax field)
+    private static string FieldIdentity(BaseFieldDeclarationSyntax field)
     {
-        var containingTypes = field.Ancestors()
+        var variables = string.Join(",", field.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
+        return $"{ContainingTypeIdentity(field)}:{field.Modifiers}:{field.Declaration.Type.WithoutTrivia()}:{variables}";
+    }
+
+    private static string PropertyIdentity(BasePropertyDeclarationSyntax property) => property switch
+    {
+        PropertyDeclarationSyntax declaration =>
+            $"{ContainingTypeIdentity(declaration)}::{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}:{declaration.Type.WithoutTrivia()}",
+        IndexerDeclarationSyntax declaration =>
+            $"{ContainingTypeIdentity(declaration)}::{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}this[{ParameterIdentity(declaration.ParameterList.Parameters)}]:{declaration.Type.WithoutTrivia()}",
+        EventDeclarationSyntax declaration =>
+            $"{ContainingTypeIdentity(declaration)}::event {declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}:{declaration.Type.WithoutTrivia()}",
+        _ => $"{ContainingTypeIdentity(property)}::{property.Kind()}"
+    };
+
+    private static string AccessorIdentity(AccessorDeclarationSyntax accessor)
+    {
+        var property = accessor.Ancestors().OfType<BasePropertyDeclarationSyntax>().FirstOrDefault();
+        return $"{(property is null ? ContainingTypeIdentity(accessor) : PropertyIdentity(property))}:{accessor.Kind()}";
+    }
+
+    private static string ContainingExecutableIdentity(SyntaxNode node)
+    {
+        var method = node.Ancestors().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
+        if (method is not null)
+        {
+            return MethodIdentity(method);
+        }
+
+        var accessor = node.Ancestors().OfType<AccessorDeclarationSyntax>().FirstOrDefault();
+        return accessor is null ? ContainingTypeIdentity(node) : AccessorIdentity(accessor);
+    }
+
+    private static string ContainingTypeIdentity(SyntaxNode node)
+    {
+        var namespaces = node.Ancestors()
+            .OfType<BaseNamespaceDeclarationSyntax>()
+            .Reverse()
+            .Select(static declaration => declaration.Name.WithoutTrivia().ToString());
+        var types = node.Ancestors()
             .OfType<TypeDeclarationSyntax>()
             .Reverse()
-            .Select(static type => type.Identifier.ValueText);
-        var variables = string.Join(",", field.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
-        return $"{string.Join(".", containingTypes)}:{field.Modifiers}:{field.Declaration.Type.WithoutTrivia()}:{variables}";
+            .Select(static type => $"{type.Identifier.ValueText}`{type.TypeParameterList?.Parameters.Count ?? 0}");
+        return string.Join(".", namespaces.Concat(types));
     }
 
-    private static string FindPortablePdbPath(string assemblyPath)
+    private static string ParameterIdentity(IEnumerable<ParameterSyntax> parameters) => string.Join(
+        ",",
+        parameters.Select(static parameter => $"{parameter.Modifiers}:{parameter.Type?.WithoutTrivia()}"));
+
+    private static string FindPortablePdbPath(string assemblyPath, ImmutableArray<byte> peImage)
     {
-        using var stream = File.OpenRead(assemblyPath);
-        using var peReader = new PEReader(stream);
+        using var peReader = new PEReader(peImage);
         var embeddedCandidates = peReader.ReadDebugDirectory()
             .Where(static entry => entry.Type == DebugDirectoryEntryType.CodeView)
             .Select(entry => peReader.ReadCodeViewDebugDirectoryData(entry).Path)
@@ -724,6 +801,13 @@ public sealed class HotReloadDeltaSession : IDisposable
         }
 
         return embeddedCandidates[0];
+    }
+
+    private static Guid ReadModuleId(ImmutableArray<byte> peImage)
+    {
+        using var peReader = new PEReader(peImage);
+        var metadata = peReader.GetMetadataReader();
+        return metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
     }
 
     private async Task<FullPdbResult> EmitFullPdbAsync(

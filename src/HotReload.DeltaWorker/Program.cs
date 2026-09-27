@@ -5,8 +5,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Reflection.Metadata;
-using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -106,32 +104,44 @@ static async Task<object> StartSessionAsync(
         request.TargetFramework,
         request.MsBuildProperties,
         request.RuntimeCapabilities);
-    var sessionId = "hr_" + Guid.NewGuid().ToString("N");
-    var moduleId = ReadModuleId(session.Info.OutputAssemblyPath);
-    var runtimeCapabilities = request.RuntimeCapabilities is { Count: > 0 }
-        ? request.RuntimeCapabilities
-        : ["Baseline"];
-    var workerSession = new WorkerSession(
-        sessionId,
-        workspaceRoot,
-        runtimeCapabilities,
-        session,
-        moduleId);
-    sessions.Add(sessionId, workerSession);
-    return new
+    string? sessionId = null;
+    try
     {
-        sessionId,
-        projectPath = session.Info.ProjectPath,
-        workspaceRoot,
-        configuration = session.Info.Configuration,
-        targetFramework = session.Info.TargetFramework,
-        outputAssemblyPath = session.Info.OutputAssemblyPath,
-        pdbPath = session.Info.PdbPath,
-        moduleName = session.Info.ModuleName,
-        moduleId,
-        runtimeCapabilities = workerSession.RuntimeCapabilities,
-        startedAt = DateTimeOffset.UtcNow
-    };
+        sessionId = "hr_" + Guid.NewGuid().ToString("N");
+        var runtimeCapabilities = request.RuntimeCapabilities is { Count: > 0 }
+            ? request.RuntimeCapabilities
+            : ["Baseline"];
+        var workerSession = new WorkerSession(
+            sessionId,
+            workspaceRoot,
+            runtimeCapabilities,
+            session,
+            session.Info.ModuleId);
+        sessions.Add(sessionId, workerSession);
+        return new
+        {
+            sessionId,
+            projectPath = session.Info.ProjectPath,
+            workspaceRoot,
+            configuration = session.Info.Configuration,
+            targetFramework = session.Info.TargetFramework,
+            outputAssemblyPath = session.Info.OutputAssemblyPath,
+            pdbPath = session.Info.PdbPath,
+            moduleName = session.Info.ModuleName,
+            moduleId = session.Info.ModuleId,
+            runtimeCapabilities = workerSession.RuntimeCapabilities,
+            startedAt = DateTimeOffset.UtcNow
+        };
+    }
+    catch
+    {
+        if (sessionId is not null)
+        {
+            sessions.Remove(sessionId);
+        }
+        session.Dispose();
+        throw;
+    }
 }
 
 static async Task<object> PrepareUpdateAsync(
@@ -167,6 +177,18 @@ static async Task<object> PrepareUpdateAsync(
 
         return new HotReloadDeltaDocumentChange(filePath, document.Text);
     }).ToArray();
+    var duplicateDocument = changes
+        .GroupBy(
+            static change => change.FilePath,
+            OperatingSystem.IsWindows() ? StringComparer.OrdinalIgnoreCase : StringComparer.Ordinal)
+        .FirstOrDefault(static group => group.Skip(1).Any());
+    if (duplicateDocument is not null)
+    {
+        throw new WorkerException(
+            "hot_reload_invalid_request",
+            $"A document may appear only once in an update: {duplicateDocument.Key}");
+    }
+
     var prepared = await session.Session.PrepareUpdateAsync(changes);
     var updateId = "upd_" + Guid.NewGuid().ToString("N");
     var artifacts = new List<ArtifactData>();
@@ -377,14 +399,6 @@ static void DeleteArtifactBestEffort(string path)
     catch (UnauthorizedAccessException)
     {
     }
-}
-
-static Guid ReadModuleId(string assemblyPath)
-{
-    using var stream = File.OpenRead(assemblyPath);
-    using var peReader = new PEReader(stream);
-    var metadata = peReader.GetMetadataReader();
-    return metadata.GetGuid(metadata.GetModuleDefinition().Mvid);
 }
 
 static bool IsUnderRoot(string root, string path)
