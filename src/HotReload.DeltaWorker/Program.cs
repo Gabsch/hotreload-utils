@@ -88,8 +88,10 @@ static async Task<object> StartSessionAsync(
         ?? throw new WorkerException("hot_reload_invalid_request", "startSession parameters are required.");
     var workspaceRoot = Path.GetFullPath(request.WorkspaceRoot);
     var projectPath = Path.GetFullPath(request.ProjectPath);
+    var resolvedWorkspaceRoot = ResolvePathThroughExistingLinks(workspaceRoot);
+    var resolvedProjectPath = ResolvePathThroughExistingLinks(projectPath);
     if (!Directory.Exists(workspaceRoot) ||
-        !IsUnderRoot(workspaceRoot, projectPath) ||
+        !IsUnderRoot(resolvedWorkspaceRoot, resolvedProjectPath) ||
         !File.Exists(projectPath) ||
         !string.Equals(Path.GetExtension(projectPath), ".csproj", StringComparison.OrdinalIgnoreCase))
     {

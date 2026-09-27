@@ -8,6 +8,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection.Metadata;
 using System.Reflection.Metadata.Ecma335;
+using System.Reflection.PortableExecutable;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
@@ -17,6 +18,7 @@ using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Emit;
 using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
+using Microsoft.CodeAnalysis.MSBuild;
 using Microsoft.CodeAnalysis.Text;
 
 namespace Microsoft.DotNet.HotReload.Utils.Generator;
@@ -85,23 +87,30 @@ public sealed record HotReloadDeltaPreparedUpdate(
 public sealed class HotReloadDeltaSession : IDisposable
 {
     private readonly HotReloadService hotReloadService;
+    private readonly MSBuildWorkspace workspace;
     private Solution solution;
     private readonly ProjectId projectId;
+    private ImmutableArray<byte> baselinePe;
     private ImmutableArray<byte> baselinePdb;
     private Solution? pendingSolution;
+    private ImmutableArray<byte>? pendingPe;
     private ImmutableArray<byte>? pendingPdb;
     private bool ended;
 
     private HotReloadDeltaSession(
         HotReloadService hotReloadService,
+        MSBuildWorkspace workspace,
         Solution solution,
         ProjectId projectId,
+        ImmutableArray<byte> baselinePe,
         ImmutableArray<byte> baselinePdb,
         HotReloadDeltaSessionInfo info)
     {
         this.hotReloadService = hotReloadService;
+        this.workspace = workspace;
         this.solution = solution;
         this.projectId = projectId;
+        this.baselinePe = baselinePe;
         this.baselinePdb = baselinePdb;
         Info = info;
     }
@@ -150,28 +159,53 @@ public sealed class HotReloadDeltaSession : IDisposable
         }
 
         var baselineProject = await BaselineProject.Make(builder.Bake(), capabilities, cancellationToken);
-        var artifacts = await baselineProject.PrepareBaseline(cancellationToken);
+        BaselineArtifacts artifacts;
+        try
+        {
+            artifacts = await baselineProject.PrepareBaseline(cancellationToken);
+        }
+        catch
+        {
+            baselineProject.Workspace.Dispose();
+            throw;
+        }
         var outputAssembly = Path.GetFullPath(artifacts.BaselineOutputAsmPath);
         var pdbPath = Path.ChangeExtension(outputAssembly, ".pdb");
-        if (!File.Exists(pdbPath))
+        try
         {
-            artifacts.HotReloadService.EndSession();
-            throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
-        }
+            if (!File.Exists(pdbPath))
+            {
+                throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
+            }
 
-        var info = new HotReloadDeltaSessionInfo(
-            builder.ProjectPath,
-            configuration,
-            targetFramework,
-            outputAssembly,
-            pdbPath,
-            Path.GetFileName(outputAssembly));
-        return new HotReloadDeltaSession(
-            artifacts.HotReloadService,
-            artifacts.BaselineSolution,
-            artifacts.BaselineProjectId,
-            (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray(),
-            info);
+            var info = new HotReloadDeltaSessionInfo(
+                builder.ProjectPath,
+                configuration,
+                targetFramework,
+                outputAssembly,
+                pdbPath,
+                Path.GetFileName(outputAssembly));
+            return new HotReloadDeltaSession(
+                artifacts.HotReloadService,
+                artifacts.Workspace,
+                artifacts.BaselineSolution,
+                artifacts.BaselineProjectId,
+                (await File.ReadAllBytesAsync(outputAssembly, cancellationToken)).ToImmutableArray(),
+                (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray(),
+                info);
+        }
+        catch
+        {
+            try
+            {
+                artifacts.HotReloadService.EndSession();
+            }
+            finally
+            {
+                artifacts.Workspace.Dispose();
+            }
+            throw;
+        }
     }
 
     public async Task<HotReloadDeltaPreparedUpdate> PrepareUpdateAsync(
@@ -352,6 +386,13 @@ public sealed class HotReloadDeltaSession : IDisposable
                 return RestartRequired(changes, fullPdb.Error!);
             }
 
+            var tokenValidation = ValidateMethodTokenIdentity(baselinePe, fullPdb.Pe);
+            if (tokenValidation is not null)
+            {
+                hotReloadService.DiscardUpdate();
+                return RestartRequired(changes, tokenValidation);
+            }
+
             ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
             var includesUpdatedMethodMappings = false;
             if (hasLineMovingChanges)
@@ -374,6 +415,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             pendingSolution = updatedSolution;
+            pendingPe = fullPdb.Pe;
             pendingPdb = fullPdb.Pdb;
             return new(
                 HotReloadDeltaUpdateStatus.Ready,
@@ -404,6 +446,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             {
                 hotReloadService.DiscardUpdate();
                 pendingSolution = null;
+                pendingPe = null;
                 pendingPdb = null;
             }
             catch (Exception discardFailure)
@@ -428,8 +471,10 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         hotReloadService.CommitUpdate();
         solution = pendingSolution;
+        baselinePe = pendingPe ?? baselinePe;
         baselinePdb = pendingPdb ?? baselinePdb;
         pendingSolution = null;
+        pendingPe = null;
         pendingPdb = null;
     }
 
@@ -443,6 +488,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         hotReloadService.DiscardUpdate();
         pendingSolution = null;
+        pendingPe = null;
         pendingPdb = null;
     }
 
@@ -453,15 +499,28 @@ public sealed class HotReloadDeltaSession : IDisposable
             return;
         }
 
-        if (pendingSolution is not null)
+        try
         {
-            hotReloadService.DiscardUpdate();
-            pendingSolution = null;
-            pendingPdb = null;
+            if (pendingSolution is not null)
+            {
+                hotReloadService.DiscardUpdate();
+                pendingSolution = null;
+                pendingPe = null;
+                pendingPdb = null;
+            }
         }
-
-        hotReloadService.EndSession();
-        ended = true;
+        finally
+        {
+            try
+            {
+                hotReloadService.EndSession();
+            }
+            finally
+            {
+                workspace.Dispose();
+                ended = true;
+            }
+        }
     }
 
     private HotReloadDeltaPreparedUpdate RestartRequired(
@@ -496,7 +555,10 @@ public sealed class HotReloadDeltaSession : IDisposable
     }
 
     private static bool ContainsLineDirective(SourceText text) =>
-        text.ToString().Contains("#line", StringComparison.Ordinal);
+        CSharpSyntaxTree.ParseText(text)
+            .GetRoot()
+            .DescendantTrivia(descendIntoTrivia: true)
+            .Any(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia));
 
     private static bool HasLineMovingChanges(SourceText oldText, SourceText newText)
     {
@@ -510,6 +572,25 @@ public sealed class HotReloadDeltaSession : IDisposable
         foreach (var (line, positions) in oldPositions)
         {
             if (!newPositions.TryGetValue(line, out var updatedPositions))
+            {
+                continue;
+            }
+
+            var sharedCount = Math.Min(positions.Count, updatedPositions.Count);
+            for (var index = 0; index < sharedCount; index++)
+            {
+                if (positions[index] != updatedPositions[index])
+                {
+                    return true;
+                }
+            }
+        }
+
+        var oldSyntaxPositions = GetStableSyntaxLinePositions(oldText);
+        var newSyntaxPositions = GetStableSyntaxLinePositions(newText);
+        foreach (var (identity, positions) in oldSyntaxPositions)
+        {
+            if (!newSyntaxPositions.TryGetValue(identity, out var updatedPositions))
             {
                 continue;
             }
@@ -545,6 +626,54 @@ public sealed class HotReloadDeltaSession : IDisposable
         return result;
     }
 
+    private static Dictionary<string, List<int>> GetStableSyntaxLinePositions(SourceText text)
+    {
+        var tree = CSharpSyntaxTree.ParseText(text);
+        var root = tree.GetRoot();
+        var result = new Dictionary<string, List<int>>(StringComparer.Ordinal);
+        foreach (var node in root.DescendantNodes())
+        {
+            string? identity = node switch
+            {
+                MethodDeclarationSyntax method => "method:" + MethodIdentity(method),
+                LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
+                _ => null
+            };
+            if (identity is null)
+            {
+                continue;
+            }
+
+            if (!result.TryGetValue(identity, out var positions))
+            {
+                positions = [];
+                result.Add(identity, positions);
+            }
+
+            positions.Add(tree.GetLineSpan(node.Span).StartLinePosition.Line);
+        }
+
+        return result;
+    }
+
+    private static string MethodIdentity(MethodDeclarationSyntax method)
+    {
+        var containingTypes = method.Ancestors()
+            .OfType<TypeDeclarationSyntax>()
+            .Reverse()
+            .Select(static type => type.Identifier.ValueText);
+        var parameters = method.ParameterList.Parameters.Select(static parameter =>
+            $"{parameter.Modifiers}:{parameter.Type?.WithoutTrivia()}");
+        return $"{string.Join(".", containingTypes)}::{method.Identifier.ValueText}({string.Join(",", parameters)})";
+    }
+
+    private static string LocalIdentity(LocalDeclarationStatementSyntax local)
+    {
+        var method = local.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+        var variables = string.Join(",", local.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
+        return $"{(method is null ? string.Empty : MethodIdentity(method))}:{local.Declaration.Type.WithoutTrivia()}:{variables}";
+    }
+
     private async Task<FullPdbResult> EmitFullPdbAsync(
         Project updatedProject,
         CancellationToken cancellationToken)
@@ -572,7 +701,9 @@ public sealed class HotReloadDeltaSession : IDisposable
             return FullPdbResult.Fail($"The updated portable PDB could not be emitted: {message}");
         }
 
-        return FullPdbResult.Ok(pdbStream.ToArray().ToImmutableArray());
+        return FullPdbResult.Ok(
+            peStream.ToArray().ToImmutableArray(),
+            pdbStream.ToArray().ToImmutableArray());
     }
 
     private async Task<ExactLineUpdateResult> CreateExactLineUpdatesAsync(
@@ -765,6 +896,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                     newIndex > lowerBound &&
                     newIndex < upperBound &&
                     !usedNewIndexes.Contains(newIndex) &&
+                    oldAnchors[oldIndex] is not null &&
+                    newAnchors[newIndex] is not null &&
                     HasEqualVisibleSequencePointStructure(
                         oldPoints[oldIndex],
                         newPoints[newIndex],
@@ -929,6 +1062,50 @@ public sealed class HotReloadDeltaSession : IDisposable
         return result.ToImmutable();
     }
 
+    private static string? ValidateMethodTokenIdentity(
+        ImmutableArray<byte> committedPe,
+        ImmutableArray<byte> updatedPe)
+    {
+        var committedMethods = ReadMethodTokenIdentities(committedPe);
+        var updatedMethods = ReadMethodTokenIdentities(updatedPe);
+        if (committedMethods.Count != updatedMethods.Count)
+        {
+            return "The edit changes the method-definition table. Exact relocation requires restart until full-PDB method tokens can be correlated with EnC runtime tokens.";
+        }
+
+        foreach (var (token, identity) in committedMethods)
+        {
+            if (!updatedMethods.TryGetValue(token, out var updatedIdentity) ||
+                !string.Equals(identity, updatedIdentity, StringComparison.Ordinal))
+            {
+                return $"Method token 0x{token:x8} changed identity in the full portable-PDB emit. Exact relocation requires restart to preserve runtime token alignment.";
+            }
+        }
+
+        return null;
+    }
+
+    private static Dictionary<int, string> ReadMethodTokenIdentities(ImmutableArray<byte> peImage)
+    {
+        using var peReader = new PEReader(peImage);
+        var reader = peReader.GetMetadataReader();
+        var result = new Dictionary<int, string>();
+        foreach (var typeHandle in reader.TypeDefinitions)
+        {
+            var type = reader.GetTypeDefinition(typeHandle);
+            var typeName = $"{reader.GetString(type.Namespace)}.{reader.GetString(type.Name)}";
+            foreach (var methodHandle in type.GetMethods())
+            {
+                var method = reader.GetMethodDefinition(methodHandle);
+                var token = MetadataTokens.GetToken(methodHandle);
+                var signature = Convert.ToHexString(reader.GetBlobBytes(method.Signature));
+                result.Add(token, $"{typeName}::{reader.GetString(method.Name)}:{signature}");
+            }
+        }
+
+        return result;
+    }
+
     private static string ContentHash(SourceText text) =>
         Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(text.ToString()))).ToLowerInvariant();
 
@@ -1002,11 +1179,13 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     private sealed record FullPdbResult(
         bool Success,
+        ImmutableArray<byte> Pe,
         ImmutableArray<byte> Pdb,
         string? Error)
     {
-        public static FullPdbResult Ok(ImmutableArray<byte> pdb) => new(true, pdb, null);
+        public static FullPdbResult Ok(ImmutableArray<byte> pe, ImmutableArray<byte> pdb) =>
+            new(true, pe, pdb, null);
 
-        public static FullPdbResult Fail(string error) => new(false, [], error);
+        public static FullPdbResult Fail(string error) => new(false, [], [], error);
     }
 }

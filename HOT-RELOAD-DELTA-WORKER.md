@@ -14,9 +14,16 @@ sequence-point-correlation artifacts. Line-moving edits are accepted only when
 the worker can prove a complete, unambiguous mapping from committed and updated
 source/PDB evidence. Ambiguous mappings, `#line` directives, and unsupported
 document changes are classified as restart-required before a delta is exposed.
+Line-moving Razor updates require restart when generated sequence points cannot
+be tied to Razor syntax identity. Updates that change the method-definition
+table also require restart so a full-PDB baseline can never drift from the
+runtime's EnC method tokens.
 
 The original CLI and generator behavior remain available. The worker does not treat
 the experimental CLI as its production boundary.
+
+Payload publishing requires a clean worktree so `PROVENANCE.txt` identifies the
+exact source commit used to build the archive.
 
 ## Build
 

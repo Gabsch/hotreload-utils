@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Dependencies>
   <ProductDependencies>
-    <Dependency Name="Microsoft.CodeAnalysis" Version="5.6.0-2.26178.1">
-      <Uri>https://github.com/dotnet/roslyn</Uri>
-      <Sha>849bed61024b171e673b9a1fac565b30e3ae1934</Sha>
+    <Dependency Name="Microsoft.CodeAnalysis" Version="5.9.0-1.26310.106">
+      <Uri>https://github.com/dotnet/dotnet</Uri>
+      <Sha>8d5d82abe13ac88cf5b2343e77460243b5272a6b</Sha>
     </Dependency>
   </ProductDependencies>
   <ToolsetDependencies>
@@ -11,9 +11,9 @@
       <Uri>https://github.com/dotnet/arcade</Uri>
       <Sha>30f8bf581e0e0d7e1de30898de8fa9c4008d2f5e</Sha>
     </Dependency>
-    <Dependency Name="Microsoft.DotNet.Build.Tasks.Templating" Version="11.0.0-beta.26177.6">
-      <Uri>https://github.com/dotnet/arcade</Uri>
-      <Sha>30f8bf581e0e0d7e1de30898de8fa9c4008d2f5e</Sha>
+    <Dependency Name="Microsoft.DotNet.Build.Tasks.Templating" Version="10.0.0-beta.25578.106">
+      <Uri>https://github.com/dotnet/dotnet</Uri>
+      <Sha>ba5cda19aa70d59758a74b7d36c90e009b32f6f0</Sha>
     </Dependency>
     <Dependency Name="Microsoft.DotNet.XUnitExtensions" Version="11.0.0-beta.26177.6">
       <Uri>https://github.com/dotnet/arcade</Uri>

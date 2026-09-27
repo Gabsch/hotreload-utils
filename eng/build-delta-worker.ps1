@@ -15,6 +15,13 @@ $publishRoot = if ([string]::IsNullOrWhiteSpace($OutputPath)) {
     [IO.Path]::GetFullPath($OutputPath)
 }
 $forkCommit = (git -C $repositoryRoot rev-parse HEAD).Trim()
+$dirtyState = @(git -C $repositoryRoot status --porcelain --untracked-files=all)
+if ($LASTEXITCODE -ne 0) {
+    throw "Could not inspect the Hot Reload delta worker source state."
+}
+if ($dirtyState.Count -ne 0) {
+    throw "Refusing to publish from a dirty worktree because the recorded fork commit would not identify the packaged source exactly."
+}
 $versionsPath = Join-Path $repositoryRoot "eng\Versions.props"
 [xml]$versions = Get-Content -LiteralPath $versionsPath -Raw
 $roslynVersion = [string]$versions.Project.PropertyGroup.MicrosoftCodeAnalysisVersion

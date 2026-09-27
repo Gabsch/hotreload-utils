@@ -17,14 +17,14 @@ using System.Collections.Immutable;
 
 namespace Microsoft.DotNet.HotReload.Utils.Generator;
 
-internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotReloadService HotReloadService) {
+internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotReloadService HotReloadService, MSBuildWorkspace Workspace) {
 
     public static async Task<BaselineProject> Make (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default) {
-        (var changeMakerService, var solution, var projectId) = await PrepareMSBuildProject(config, capabilities, ct);
-        return new BaselineProject(solution, projectId, changeMakerService);
+        (var changeMakerService, var solution, var projectId, var workspace) = await PrepareMSBuildProject(config, capabilities, ct);
+        return new BaselineProject(solution, projectId, changeMakerService, workspace);
     }
 
-    static async Task<(HotReloadService, Solution, ProjectId)> PrepareMSBuildProject (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default)
+    static async Task<(HotReloadService, Solution, ProjectId, MSBuildWorkspace)> PrepareMSBuildProject (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default)
     {
         // https://stackoverflow.com/questions/43386267/roslyn-project-configuration says I have to specify at least a Configuration property
         // to get an output path, is that true?
@@ -46,13 +46,19 @@ internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotRelo
             Parameters = "/tmp/enc.binlog"
         };
 #endif
-        var project = await workspace.OpenProjectAsync (config.ProjectPath, logger, null, ct);
+        try {
+            var project = await workspace.OpenProjectAsync (config.ProjectPath, logger, null, ct);
 
-        var service = new HotReloadService(
-            workspace.CurrentSolution.Services,
-            () => new([.. capabilities.ToString().Split(", ")]));
+            var service = new HotReloadService(
+                workspace.CurrentSolution.Services,
+                () => new([.. capabilities.ToString().Split(", ")]));
 
-        return (service, workspace.CurrentSolution, project.Id);
+            return (service, workspace.CurrentSolution, project.Id, workspace);
+        }
+        catch {
+            workspace.Dispose();
+            throw;
+        }
     }
 
 
@@ -86,7 +92,8 @@ internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotRelo
             BaselineProjectId = ProjectId,
             BaselineOutputAsmPath = outputAsm,
             DocResolver = new DocResolver (project),
-            HotReloadService = HotReloadService
+            HotReloadService = HotReloadService,
+            Workspace = Workspace
         };
         await t;
         return artifacts;
