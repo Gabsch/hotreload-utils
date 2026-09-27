@@ -92,6 +92,7 @@ public sealed class HotReloadDeltaSession : IDisposable
     private readonly HotReloadService hotReloadService;
     private readonly MSBuildWorkspace workspace;
     private Solution solution;
+    private Solution pdbSolution;
     private readonly ProjectId projectId;
     private ImmutableArray<byte> baselinePe;
     private ImmutableArray<byte> baselinePdb;
@@ -112,6 +113,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         this.hotReloadService = hotReloadService;
         this.workspace = workspace;
         this.solution = solution;
+        pdbSolution = solution;
         this.projectId = projectId;
         this.baselinePe = baselinePe;
         this.baselinePdb = baselinePdb;
@@ -277,15 +279,27 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
+            var pdbProject = pdbSolution.GetProject(projectId)!;
+            TextDocument? pdbDocument = isAdditionalDocument
+                ? pdbProject.AdditionalDocuments.SingleOrDefault(candidate =>
+                    string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison))
+                : pdbProject.Documents.SingleOrDefault(candidate =>
+                    string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison));
+            if (pdbDocument is null)
+            {
+                return RestartRequired(normalizedChanges, $"Document is not part of the portable-PDB baseline project: {path}");
+            }
+
+            var pdbText = await pdbDocument.GetTextAsync(cancellationToken);
             if (!isAdditionalDocument &&
-                (ContainsLineDirective(oldText) || ContainsLineDirective(newText)))
+                (ContainsLineDirective(pdbText) || ContainsLineDirective(newText)))
             {
                 return RestartRequired(
                     normalizedChanges,
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
             }
 
-            if (HasLineMovingChanges(oldText, newText))
+            if (HasLineMovingChanges(pdbText, newText))
             {
                 lineMovingFiles.Add(path);
             }
@@ -429,7 +443,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             if (lineMovingFiles.Count > 0)
             {
                 var mapping = await CreateExactLineUpdatesAsync(
-                    solution.GetProject(projectId)!,
+                    pdbSolution.GetProject(projectId)!,
                     updatedSolution.GetProject(projectId)!,
                     fullPdb.Pdb,
                     lineMovingFiles.ToImmutableArray(),
@@ -502,6 +516,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         hotReloadService.CommitUpdate();
         solution = pendingSolution;
+        pdbSolution = pendingSolution;
         baselinePe = pendingPe ?? baselinePe;
         baselinePdb = pendingPdb ?? baselinePdb;
         pendingSolution = null;
@@ -665,6 +680,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 BasePropertyDeclarationSyntax property => "property:" + PropertyIdentity(property),
                 AccessorDeclarationSyntax accessor => "accessor:" + AccessorIdentity(accessor),
                 ArrowExpressionClauseSyntax arrow => "arrow:" + ArrowExpressionIdentity(arrow),
+                LambdaExpressionSyntax lambda => "lambda:" + LambdaIdentity(lambda),
                 LocalFunctionStatementSyntax localFunction => "local-function:" + LocalFunctionIdentity(localFunction),
                 LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
                 BaseFieldDeclarationSyntax field => "field:" + FieldIdentity(field),
@@ -682,7 +698,12 @@ public sealed class HotReloadDeltaSession : IDisposable
                 result.Add(identity, positions);
             }
 
-            var positionNode = node is ArrowExpressionClauseSyntax arrowClause ? arrowClause.Expression : node;
+            var positionNode = node switch
+            {
+                ArrowExpressionClauseSyntax arrowClause => arrowClause.Expression,
+                LambdaExpressionSyntax { Body: ExpressionSyntax expression } => expression,
+                _ => node
+            };
             positions.Add(tree.GetLineSpan(positionNode.Span).StartLinePosition.Line);
         }
 
@@ -755,6 +776,32 @@ public sealed class HotReloadDeltaSession : IDisposable
         LocalFunctionStatementSyntax localFunction => LocalFunctionIdentity(localFunction),
         _ => ContainingExecutableIdentity(arrow)
     };
+
+    private static string LambdaIdentity(LambdaExpressionSyntax lambda)
+    {
+        var variable = lambda.Ancestors().OfType<VariableDeclaratorSyntax>().FirstOrDefault();
+        SyntaxNode scope = variable
+            ?? lambda.Ancestors().FirstOrDefault(static ancestor => ancestor is
+                BaseMethodDeclarationSyntax or
+                BasePropertyDeclarationSyntax or
+                AccessorDeclarationSyntax or
+                BaseFieldDeclarationSyntax)
+            ?? lambda.SyntaxTree.GetRoot();
+        var owner = variable is null
+            ? ContainingExecutableIdentity(lambda)
+            : $"{ContainingExecutableIdentity(variable)}:variable:{variable.Identifier.ValueText}";
+        var ordinal = scope.DescendantNodes()
+            .OfType<LambdaExpressionSyntax>()
+            .TakeWhile(candidate => !ReferenceEquals(candidate, lambda))
+            .Count();
+        var parameters = lambda switch
+        {
+            SimpleLambdaExpressionSyntax simple => ParameterIdentity([simple.Parameter]),
+            ParenthesizedLambdaExpressionSyntax parenthesized => ParameterIdentity(parenthesized.ParameterList.Parameters),
+            _ => string.Empty
+        };
+        return $"{owner}:lambda:{ordinal}({parameters})";
+    }
 
     private static string ContainingExecutableIdentity(SyntaxNode node)
     {

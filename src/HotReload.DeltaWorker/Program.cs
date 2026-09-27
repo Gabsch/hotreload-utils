@@ -113,7 +113,7 @@ static async Task<object> StartSessionAsync(
             : ["Baseline"];
         var workerSession = new WorkerSession(
             sessionId,
-            workspaceRoot,
+            resolvedWorkspaceRoot,
             runtimeCapabilities,
             session,
             session.Info.ModuleId);
@@ -122,7 +122,7 @@ static async Task<object> StartSessionAsync(
         {
             sessionId,
             projectPath = session.Info.ProjectPath,
-            workspaceRoot,
+            workspaceRoot = resolvedWorkspaceRoot,
             configuration = session.Info.Configuration,
             targetFramework = session.Info.TargetFramework,
             outputAssemblyPath = session.Info.OutputAssemblyPath,

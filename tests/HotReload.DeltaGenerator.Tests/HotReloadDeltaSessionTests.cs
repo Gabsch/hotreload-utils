@@ -180,6 +180,42 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_PreservesPortablePdbSourceSnapshotAcrossNoDeltaUpdate()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+        var baselineSource = ProjectFixture.Source(1);
+        var commentOnlySource = baselineSource + "\n// comment-only update\n";
+
+        var noDelta = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, commentOnlySource)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.NoChanges, noDelta.Status);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Equal(commentOnlySource, await ReadSessionDocumentAsync(session, "solution", fixture.SourcePath));
+        Assert.Equal(baselineSource, await ReadSessionDocumentAsync(session, "pdbSolution", fixture.SourcePath));
+
+        var nextSource = ProjectFixture.SourceWithLineShift(2) + "\n// comment-only update\n";
+        var next = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, nextSource)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, next.Status);
+        Assert.Contains(next.LineUpdates, lineUpdate =>
+            lineUpdate.OldLine == FindLine(ProjectFixture.Source(1), "public static int Unchanged()") &&
+            lineUpdate.NewLine == FindLine(nextSource, "public static int Unchanged()"));
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_AllowsTrailingCommentWithoutSequencePointMovement()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -315,6 +351,18 @@ public sealed class HotReloadDeltaSessionTests
             lineUpdate.OldLine == FindLine(baseline, "public static int Unchanged()") &&
             lineUpdate.NewLine == FindLine(updated, "public static int Unchanged()"));
         session.DiscardUpdate();
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Session_DetectsExpressionBodiedLambdaMovement(bool fieldLambda)
+    {
+        var baseline = ProjectFixture.ExpressionLambdaSource(fieldLambda, shifted: false);
+        var updated = ProjectFixture.ExpressionLambdaSource(fieldLambda, shifted: true);
+
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.True(DetectLineMovement(baseline, updated));
     }
 
     [Fact]
@@ -1186,6 +1234,115 @@ public sealed class HotReloadDeltaSessionTests
         }
     }
 
+    [Fact]
+    public async Task Worker_RetainsResolvedWorkspaceRootForLaterRequests()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        var aliasParent = Path.Combine(
+            Path.GetTempPath(),
+            "hotreload-delta-generator-tests-alias",
+            Guid.NewGuid().ToString("N"));
+        var aliasRoot = Path.Combine(aliasParent, "workspace");
+        Directory.CreateDirectory(aliasParent);
+        try
+        {
+            try
+            {
+                Directory.CreateSymbolicLink(aliasRoot, fixture.Root);
+            }
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+            {
+                Assert.Skip($"Symbolic links are unavailable in this test environment: {exception.Message}");
+                return;
+            }
+
+            using var worker = StartWorker();
+            var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+            try
+            {
+                var started = await SendWorkerRequestAsync(
+                    worker,
+                    "start",
+                    "startSession",
+                    new
+                    {
+                        projectPath = fixture.ProjectPath,
+                        workspaceRoot = aliasRoot,
+                        configuration = "Debug",
+                        targetFramework = "net10.0",
+                        msBuildProperties = (object?)null,
+                        runtimeCapabilities = new[] { "Baseline" }
+                    },
+                    cancellationToken);
+                Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+                Assert.Equal(
+                    Path.GetFullPath(fixture.Root),
+                    started.GetProperty("result").GetProperty("workspaceRoot").GetString());
+                var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+
+                var prepared = await SendWorkerRequestAsync(
+                    worker,
+                    "prepare",
+                    "prepareUpdate",
+                    new
+                    {
+                        sessionId,
+                        changedDocuments = new[]
+                        {
+                            new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                        },
+                        artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                    },
+                    cancellationToken);
+                Assert.True(prepared.GetProperty("success").GetBoolean(), prepared.ToString());
+                var updateId = prepared.GetProperty("result").GetProperty("updateId").GetString()!;
+
+                var discarded = await SendWorkerRequestAsync(
+                    worker,
+                    "discard",
+                    "discardUpdate",
+                    new { sessionId, updateId },
+                    cancellationToken);
+                Assert.True(discarded.GetProperty("success").GetBoolean(), discarded.ToString());
+
+                var ended = await SendWorkerRequestAsync(
+                    worker,
+                    "end",
+                    "endSession",
+                    new { sessionId },
+                    cancellationToken);
+                Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+                worker.StandardInput.Close();
+                await worker.WaitForExitAsync(cancellationToken);
+                Assert.True(worker.ExitCode == 0, await stderr);
+            }
+            finally
+            {
+                if (!worker.HasExited)
+                {
+                    worker.Kill(entireProcessTree: true);
+                    await worker.WaitForExitAsync(CancellationToken.None);
+                }
+            }
+        }
+        finally
+        {
+            try
+            {
+                if (Directory.Exists(aliasRoot))
+                {
+                    Directory.Delete(aliasRoot);
+                }
+                Directory.Delete(aliasParent);
+            }
+            catch
+            {
+            }
+        }
+    }
+
     private static Process StartWorker()
     {
         var repositoryRoot = FindRepositoryRoot();
@@ -1265,6 +1422,21 @@ public sealed class HotReloadDeltaSessionTests
             SourceText.From(baseline),
             SourceText.From(updated)
         ])!;
+    }
+
+    private static async Task<string> ReadSessionDocumentAsync(
+        HotReloadDeltaSession session,
+        string fieldName,
+        string filePath)
+    {
+        var field = typeof(HotReloadDeltaSession).GetField(
+            fieldName,
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var solution = (Microsoft.CodeAnalysis.Solution)field.GetValue(session)!;
+        var document = solution.Projects
+            .SelectMany(static project => project.Documents)
+            .Single(candidate => string.Equals(candidate.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
+        return (await document.GetTextAsync(TestContext.Current.CancellationToken)).ToString();
     }
 
     private sealed class RazorProjectFixture : IDisposable
@@ -1483,6 +1655,41 @@ public sealed class HotReloadDeltaSessionTests
                 "    public static int Unchanged()",
                 "    // inserted line\n    public static int Unchanged()",
                 StringComparison.Ordinal);
+
+        public static string ExpressionLambdaSource(bool fieldLambda, bool shifted)
+        {
+            var declaration = fieldLambda
+                ? "    private static readonly System.Func<int, int> Transform ="
+                : "        System.Func<int, int> transform =";
+            var invocation = fieldLambda ? "Transform(2)" : "transform(2)";
+            var bodyIndent = fieldLambda ? "        " : "            ";
+            var lambda = shifted
+                ? $"{declaration}\n{bodyIndent}// inserted line\n{bodyIndent}value => value * 3;"
+                : $"{declaration}\n{bodyIndent}value => value * 2;\n{bodyIndent}// removable line";
+            return fieldLambda
+                ? $$"""
+                    namespace DeltaFixture;
+
+                    public static class Calculator
+                    {
+                    {{lambda}}
+
+                        public static int Run() => {{invocation}};
+                    }
+                    """
+                : $$"""
+                    namespace DeltaFixture;
+
+                    public static class Calculator
+                    {
+                        public static int Run()
+                        {
+                    {{lambda}}
+                            return {{invocation}};
+                        }
+                    }
+                    """;
+        }
 
         public static string ActiveSource(int value) => $$"""
             namespace DeltaFixture;
