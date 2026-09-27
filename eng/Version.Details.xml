@@ -7,9 +7,9 @@
     </Dependency>
   </ProductDependencies>
   <ToolsetDependencies>
-    <Dependency Name="Microsoft.DotNet.Arcade.Sdk" Version="11.0.0-beta.26177.6">
-      <Uri>https://github.com/dotnet/arcade</Uri>
-      <Sha>30f8bf581e0e0d7e1de30898de8fa9c4008d2f5e</Sha>
+    <Dependency Name="Microsoft.DotNet.Arcade.Sdk" Version="10.0.0-beta.25578.106">
+      <Uri>https://github.com/dotnet/dotnet</Uri>
+      <Sha>ba5cda19aa70d59758a74b7d36c90e009b32f6f0</Sha>
     </Dependency>
     <Dependency Name="Microsoft.DotNet.Build.Tasks.Templating" Version="10.0.0-beta.25578.106">
       <Uri>https://github.com/dotnet/dotnet</Uri>

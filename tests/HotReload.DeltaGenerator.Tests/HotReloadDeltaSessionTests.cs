@@ -14,6 +14,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.DotNet.HotReload.Utils.Generator;
+using Microsoft.CodeAnalysis.Text;
 using Xunit;
 
 namespace HotReload.DeltaGenerator.Tests;
@@ -80,6 +81,29 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_DoesNotTreatRazorMarkupBeginningWithLineAsCSharpDirective()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = "#line documentation\n" + RazorProjectFixture.BaselineSource;
+        using var fixture = await RazorProjectFixture.CreateAsync(cancellationToken, baseline);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, "#line documentation\n" + RazorProjectFixture.UpdatedSource)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.True(session.HasPendingUpdate);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
     public async Task Session_PreparesDiscardsRegeneratesAndCommitsLineStableUpdates()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -119,6 +143,29 @@ public sealed class HotReloadDeltaSessionTests
             new(fixture.SourcePath, ProjectFixture.Source(3))
         ], cancellationToken);
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, second.Status);
+        session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_AllowsTrailingCommentWithoutSequencePointMovement()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.Source(2) + "\n// trailing comment\n")
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.Empty(update.LineUpdates);
+        Assert.True(session.HasPendingUpdate);
         session.DiscardUpdate();
     }
 
@@ -390,6 +437,47 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsCoordinatedTypeAndMethodTokenSwaps()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.ReorderedSignatureTypesSource(1, 2, reverse: false),
+            cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.ReorderedSignatureTypesSource(3, 4, reverse: true))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning => warning.Contains("Method token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void Session_DetectsReorderedChangedFieldInitializersAsLineMovement()
+    {
+        var baseline = ProjectFixture.ReorderedFieldInitializersSource(1, 2, reverse: false);
+        var updated = ProjectFixture.ReorderedFieldInitializersSource(3, 4, reverse: true);
+        var detector = typeof(HotReloadDeltaSession).GetMethod(
+            "HasLineMovingChanges",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var lineMovementDetected = (bool)detector.Invoke(null, [
+            SourceText.From(baseline),
+            SourceText.From(updated)
+        ])!;
+
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.True(lineMovementDetected);
+    }
+
+    [Fact]
     public async Task Session_DetectsReorderedChangedExpressionStatements()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -448,6 +536,27 @@ public sealed class HotReloadDeltaSessionTests
                 Directory.Delete(pdbDirectory, recursive: true);
             }
         }
+    }
+
+    [Fact]
+    public async Task Session_ReleasesWorkspaceWhenBaselinePdbIsMissing()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.Source(1),
+            cancellationToken,
+            debugType: "none");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() => HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken));
+
+        Directory.Delete(fixture.Root, recursive: true);
+        Assert.False(Directory.Exists(fixture.Root));
     }
 
     [Fact]
@@ -914,7 +1023,9 @@ public sealed class HotReloadDeltaSessionTests
             }
             """;
 
-        public static async Task<RazorProjectFixture> CreateAsync(CancellationToken cancellationToken)
+        public static async Task<RazorProjectFixture> CreateAsync(
+            CancellationToken cancellationToken,
+            string? initialSource = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-razor-delta-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -932,7 +1043,7 @@ public sealed class HotReloadDeltaSessionTests
                   </ItemGroup>
                 </Project>
                 """, cancellationToken);
-            await File.WriteAllTextAsync(fixture.ComponentPath, BaselineSource, cancellationToken);
+            await File.WriteAllTextAsync(fixture.ComponentPath, initialSource ?? BaselineSource, cancellationToken);
 
             var startInfo = new ProcessStartInfo
             {
@@ -992,7 +1103,8 @@ public sealed class HotReloadDeltaSessionTests
             string initialSource,
             CancellationToken cancellationToken,
             string? pdbFile = null,
-            string? buildPathMapTarget = null)
+            string? buildPathMapTarget = null,
+            string debugType = "portable")
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-delta-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -1004,7 +1116,7 @@ public sealed class HotReloadDeltaSessionTests
                 <Project Sdk="Microsoft.NET.Sdk">
                   <PropertyGroup>
                     <TargetFramework>net10.0</TargetFramework>
-                    <DebugType>portable</DebugType>
+                    <DebugType>{{debugType}}</DebugType>
                     <Optimize>false</Optimize>
                     {{pdbProperty}}
                   </PropertyGroup>
@@ -1172,6 +1284,44 @@ public sealed class HotReloadDeltaSessionTests
                 }
                 """;
             return "namespace DeltaFixture;\n\n" + (reverseOuterTypes ? b + "\n\n" + a : a + "\n\n" + b);
+        }
+
+        public static string ReorderedSignatureTypesSource(int first, int second, bool reverse)
+        {
+            var types = reverse
+                ? "public sealed class B { }\npublic sealed class A { }"
+                : "public sealed class A { }\npublic sealed class B { }";
+            var methods = reverse
+                ? $"    public static int M(B value) => {second};\n    public static int M(A value) => {first};"
+                : $"    public static int M(A value) => {first};\n    public static int M(B value) => {second};";
+            return $$"""
+                namespace DeltaFixture;
+
+                {{types}}
+
+                public static class Calculator
+                {
+                {{methods}}
+                }
+                """;
+        }
+
+        public static string ReorderedFieldInitializersSource(int first, int second, bool reverse)
+        {
+            var fields = reverse
+                ? $"    public static int B = G({second});\n    public static int A = F({first});"
+                : $"    public static int A = F({first});\n    public static int B = G({second});";
+            return $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                {{fields}}
+
+                    private static int F(int value) => value;
+                    private static int G(int value) => value;
+                }
+                """;
         }
 
         public static string ReorderedExpressionStatementsSource(int first, int second, bool reverseCalls)

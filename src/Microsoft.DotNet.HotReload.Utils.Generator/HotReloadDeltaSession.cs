@@ -170,9 +170,9 @@ public sealed class HotReloadDeltaSession : IDisposable
             throw;
         }
         var outputAssembly = Path.GetFullPath(artifacts.BaselineOutputAsmPath);
-        var pdbPath = FindPortablePdbPath(outputAssembly);
         try
         {
+            var pdbPath = FindPortablePdbPath(outputAssembly);
             if (!File.Exists(pdbPath))
             {
                 throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
@@ -254,8 +254,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
-            if (ContainsLineDirective(oldText) ||
-                ContainsLineDirective(newText))
+            if (!isAdditionalDocument &&
+                (ContainsLineDirective(oldText) || ContainsLineDirective(newText)))
             {
                 return RestartRequired(
                     changes,
@@ -562,11 +562,6 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     private static bool HasLineMovingChanges(SourceText oldText, SourceText newText)
     {
-        if (oldText.Lines.Count != newText.Lines.Count)
-        {
-            return true;
-        }
-
         var oldPositions = GetLinePositions(oldText);
         var newPositions = GetLinePositions(newText);
         foreach (var (line, positions) in oldPositions)
@@ -637,6 +632,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             {
                 MethodDeclarationSyntax method => "method:" + MethodIdentity(method),
                 LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
+                FieldDeclarationSyntax field => "field:" + FieldIdentity(field),
                 StatementSyntax statement => "statement:" + StatementIdentity(statement),
                 _ => null
             };
@@ -683,6 +679,16 @@ public sealed class HotReloadDeltaSession : IDisposable
                 ? $"<{token.Kind()}>"
                 : token.ValueText);
         return $"{(method is null ? string.Empty : MethodIdentity(method))}:{statement.Kind()}:{string.Join("|", tokens)}";
+    }
+
+    private static string FieldIdentity(FieldDeclarationSyntax field)
+    {
+        var containingTypes = field.Ancestors()
+            .OfType<TypeDeclarationSyntax>()
+            .Reverse()
+            .Select(static type => type.Identifier.ValueText);
+        var variables = string.Join(",", field.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
+        return $"{string.Join(".", containingTypes)}:{field.Modifiers}:{field.Declaration.Type.WithoutTrivia()}:{variables}";
     }
 
     private static string FindPortablePdbPath(string assemblyPath)
@@ -1214,8 +1220,13 @@ public sealed class HotReloadDeltaSession : IDisposable
             {
                 var method = reader.GetMethodDefinition(methodHandle);
                 var token = MetadataTokens.GetToken(methodHandle);
-                var signature = Convert.ToHexString(reader.GetBlobBytes(method.Signature));
-                result.Add(token, $"{typeName}::{reader.GetString(method.Name)}:{signature}");
+                var signature = method.DecodeSignature(MethodIdentitySignatureTypeProvider.Instance, genericContext: null);
+                var parameterTypes = string.Join(",", signature.ParameterTypes);
+                result.Add(
+                    token,
+                    $"{typeName}::{reader.GetString(method.Name)}`{signature.GenericParameterCount}" +
+                    $"({parameterTypes})->{signature.ReturnType}" +
+                    $":required={signature.RequiredParameterCount}:header={signature.Header.RawValue}");
             }
         }
 
@@ -1242,6 +1253,84 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         var nestedName = string.Join("+", names);
         return string.IsNullOrEmpty(namespaceName) ? nestedName : $"{namespaceName}.{nestedName}";
+    }
+
+    private sealed class MethodIdentitySignatureTypeProvider : ISignatureTypeProvider<string, object?>
+    {
+        public static MethodIdentitySignatureTypeProvider Instance { get; } = new();
+
+        public string GetArrayType(string elementType, ArrayShape shape) =>
+            $"{elementType}[rank={shape.Rank};sizes={string.Join(",", shape.Sizes)};lower={string.Join(",", shape.LowerBounds)}]";
+
+        public string GetByReferenceType(string elementType) => $"{elementType}&";
+
+        public string GetFunctionPointerType(MethodSignature<string> signature) =>
+            $"fnptr({string.Join(",", signature.ParameterTypes)})->{signature.ReturnType}";
+
+        public string GetGenericInstantiation(string genericType, ImmutableArray<string> typeArguments) =>
+            $"{genericType}<{string.Join(",", typeArguments)}>";
+
+        public string GetGenericMethodParameter(object? genericContext, int index) => $"!!{index}";
+
+        public string GetGenericTypeParameter(object? genericContext, int index) => $"!{index}";
+
+        public string GetModifiedType(string modifier, string unmodifiedType, bool isRequired) =>
+            $"{unmodifiedType} mod{(isRequired ? "req" : "opt")}({modifier})";
+
+        public string GetPinnedType(string elementType) => $"{elementType} pinned";
+
+        public string GetPointerType(string elementType) => $"{elementType}*";
+
+        public string GetPrimitiveType(PrimitiveTypeCode typeCode) => typeCode.ToString();
+
+        public string GetSZArrayType(string elementType) => $"{elementType}[]";
+
+        public string GetTypeFromDefinition(
+            MetadataReader reader,
+            TypeDefinitionHandle handle,
+            byte rawTypeKind) =>
+            $"def:{GetQualifiedTypeName(reader, handle)}";
+
+        public string GetTypeFromReference(
+            MetadataReader reader,
+            TypeReferenceHandle handle,
+            byte rawTypeKind) =>
+            $"ref:{GetQualifiedTypeReferenceName(reader, handle)}";
+
+        public string GetTypeFromSpecification(
+            MetadataReader reader,
+            object? genericContext,
+            TypeSpecificationHandle handle,
+            byte rawTypeKind) =>
+            reader.GetTypeSpecification(handle).DecodeSignature(this, genericContext);
+
+        private static string GetQualifiedTypeReferenceName(MetadataReader reader, TypeReferenceHandle handle)
+        {
+            var type = reader.GetTypeReference(handle);
+            var name = reader.GetString(type.Name);
+            if (type.ResolutionScope.Kind == HandleKind.TypeReference)
+            {
+                return $"{GetQualifiedTypeReferenceName(reader, (TypeReferenceHandle)type.ResolutionScope)}+{name}";
+            }
+
+            var namespaceName = reader.GetString(type.Namespace);
+            var qualifiedName = string.IsNullOrEmpty(namespaceName) ? name : $"{namespaceName}.{name}";
+            return $"{GetResolutionScopeIdentity(reader, type.ResolutionScope)}:{qualifiedName}";
+        }
+
+        private static string GetResolutionScopeIdentity(MetadataReader reader, EntityHandle scope) => scope.Kind switch
+        {
+            HandleKind.AssemblyReference => GetAssemblyReferenceIdentity(reader, (AssemblyReferenceHandle)scope),
+            HandleKind.ModuleReference => $"module:{reader.GetString(reader.GetModuleReference((ModuleReferenceHandle)scope).Name)}",
+            HandleKind.ModuleDefinition => "module:self",
+            _ => scope.Kind.ToString()
+        };
+
+        private static string GetAssemblyReferenceIdentity(MetadataReader reader, AssemblyReferenceHandle handle)
+        {
+            var assembly = reader.GetAssemblyReference(handle);
+            return $"assembly:{reader.GetString(assembly.Name)},{assembly.Version},{Convert.ToHexString(reader.GetBlobBytes(assembly.PublicKeyOrToken))}";
+        }
     }
 
     private static string ContentHash(SourceText text) =>
