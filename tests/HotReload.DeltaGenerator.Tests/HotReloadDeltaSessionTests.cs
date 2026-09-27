@@ -2,9 +2,14 @@
 // The .NET Foundation licenses this file to you under the MIT license.
 
 using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Reflection;
+using System.Reflection.Metadata;
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -361,6 +366,128 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsNestedTypeMethodTokenSwaps()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.NestedTypeSource(1, 2, reverseOuterTypes: false),
+            cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.NestedTypeSource(3, 4, reverseOuterTypes: true))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning => warning.Contains("Method token", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public async Task Session_DetectsReorderedChangedExpressionStatements()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = ProjectFixture.ReorderedExpressionStatementsSource(1, 2, reverseCalls: false);
+        var updated = ProjectFixture.ReorderedExpressionStatementsSource(3, 4, reverseCalls: true);
+        using var fixture = await ProjectFixture.CreateAsync(baseline, cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, updated)
+        ], cancellationToken);
+
+        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.False(session.HasPendingUpdate);
+    }
+
+    [Fact]
+    public async Task Session_UsesPortablePdbPathEmbeddedInBaselineAssembly()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var pdbPath = Path.Combine(
+            Path.GetTempPath(),
+            "hotreload-delta-generator-pdbs",
+            Guid.NewGuid().ToString("N"),
+            "configured.pdb");
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(pdbPath)!);
+            using var fixture = await ProjectFixture.CreateAsync(
+                ProjectFixture.Source(1),
+                cancellationToken,
+                pdbFile: pdbPath);
+            using var session = await HotReloadDeltaSession.StartAsync(
+                fixture.ProjectPath,
+                "Debug",
+                "net10.0",
+                properties: null,
+                runtimeCapabilities: ["Baseline"],
+                cancellationToken);
+
+            Assert.Equal(Path.GetFullPath(pdbPath), session.Info.PdbPath);
+        }
+        finally
+        {
+            var pdbDirectory = Path.GetDirectoryName(pdbPath)!;
+            if (Directory.Exists(pdbDirectory))
+            {
+                Directory.Delete(pdbDirectory, recursive: true);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Session_CorrelatesPathMappedPortablePdbDocumentsByChecksum()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = ProjectFixture.BalancedLineShiftBaseline(2);
+        using var fixture = await ProjectFixture.CreateAsync(
+            baseline,
+            cancellationToken,
+            buildPathMapTarget: "/_/source");
+        var pdbPath = Path.Combine(fixture.Root, "obj", "Debug", "net10.0", "DeltaFixture.pdb");
+        using var pdbStream = File.OpenRead(pdbPath);
+        using var provider = MetadataReaderProvider.FromPortablePdbStream(pdbStream);
+        var reader = provider.GetMetadataReader();
+        var document = reader.Documents
+            .Select(reader.GetDocument)
+            .Single(candidate => reader.GetString(candidate.Name).EndsWith("Calculator.cs", StringComparison.Ordinal));
+        var mappedPath = reader.GetString(document.Name);
+        var checksum = reader.GetBlobBytes(document.Hash).ToImmutableArray();
+        Assert.NotEqual(Path.GetFullPath(fixture.SourcePath), Path.GetFullPath(mappedPath));
+        Assert.Equal(SHA256.HashData(await File.ReadAllBytesAsync(fixture.SourcePath, cancellationToken)), checksum);
+
+        var resolver = typeof(HotReloadDeltaSession).GetMethod(
+            "ResolveChangedDocumentPath",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var resolvedPath = (string?)resolver.Invoke(null, [
+            mappedPath,
+            checksum,
+            new HashSet<string>([fixture.SourcePath], StringComparer.OrdinalIgnoreCase),
+            new Dictionary<string, ImmutableArray<byte>>(StringComparer.OrdinalIgnoreCase)
+            {
+                [fixture.SourcePath] = checksum
+            }
+        ]);
+
+        Assert.Equal(fixture.SourcePath, resolvedPath);
+    }
+
+    [Fact]
     public async Task Worker_DiscardsPreparedUpdateWhenArtifactWritingFails()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -607,6 +734,79 @@ public sealed class HotReloadDeltaSessionTests
         }
     }
 
+    [Fact]
+    public async Task Worker_AcceptsFilesystemRootAsWorkspaceRoot()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        using var worker = StartWorker();
+        var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            var started = await SendWorkerRequestAsync(
+                worker,
+                "start",
+                "startSession",
+                new
+                {
+                    projectPath = fixture.ProjectPath,
+                    workspaceRoot = Path.GetPathRoot(fixture.Root)!,
+                    configuration = "Debug",
+                    targetFramework = "net10.0",
+                    msBuildProperties = (object?)null,
+                    runtimeCapabilities = new[] { "Baseline" }
+                },
+                cancellationToken);
+            Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+            var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+
+            var prepared = await SendWorkerRequestAsync(
+                worker,
+                "prepare",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                    },
+                    artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                },
+                cancellationToken);
+            Assert.True(prepared.GetProperty("success").GetBoolean(), prepared.ToString());
+            var updateId = prepared.GetProperty("result").GetProperty("updateId").GetString()!;
+
+            var discarded = await SendWorkerRequestAsync(
+                worker,
+                "discard",
+                "discardUpdate",
+                new { sessionId, updateId },
+                cancellationToken);
+            Assert.True(discarded.GetProperty("success").GetBoolean(), discarded.ToString());
+
+            var ended = await SendWorkerRequestAsync(
+                worker,
+                "end",
+                "endSession",
+                new { sessionId },
+                cancellationToken);
+            Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+            worker.StandardInput.Close();
+            await worker.WaitForExitAsync(cancellationToken);
+            Assert.True(worker.ExitCode == 0, await stderr);
+        }
+        finally
+        {
+            if (!worker.HasExited)
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
     private static Process StartWorker()
     {
         var repositoryRoot = FindRepositoryRoot();
@@ -790,17 +990,23 @@ public sealed class HotReloadDeltaSessionTests
 
         public static async Task<ProjectFixture> CreateAsync(
             string initialSource,
-            CancellationToken cancellationToken)
+            CancellationToken cancellationToken,
+            string? pdbFile = null,
+            string? buildPathMapTarget = null)
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-delta-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
             var fixture = new ProjectFixture(root);
-            await File.WriteAllTextAsync(fixture.ProjectPath, """
+            var pdbProperty = pdbFile is null
+                ? string.Empty
+                : $"<PdbFile>{System.Security.SecurityElement.Escape(Path.GetFullPath(pdbFile))}</PdbFile>";
+            await File.WriteAllTextAsync(fixture.ProjectPath, $$"""
                 <Project Sdk="Microsoft.NET.Sdk">
                   <PropertyGroup>
                     <TargetFramework>net10.0</TargetFramework>
                     <DebugType>portable</DebugType>
                     <Optimize>false</Optimize>
+                    {{pdbProperty}}
                   </PropertyGroup>
                 </Project>
                 """, cancellationToken);
@@ -816,6 +1022,10 @@ public sealed class HotReloadDeltaSessionTests
             startInfo.ArgumentList.Add("build");
             startInfo.ArgumentList.Add(fixture.ProjectPath);
             startInfo.ArgumentList.Add("--nologo");
+            if (buildPathMapTarget is not null)
+            {
+                startInfo.ArgumentList.Add($"-p:PathMap={fixture.Root}={buildPathMapTarget}");
+            }
             using var process = Process.Start(startInfo)!;
             await process.WaitForExitAsync(cancellationToken);
             if (process.ExitCode != 0)
@@ -940,6 +1150,50 @@ public sealed class HotReloadDeltaSessionTests
                 }
             }
             """;
+
+        public static string NestedTypeSource(int first, int second, bool reverseOuterTypes)
+        {
+            var a = $$"""
+                public static class A
+                {
+                    public static class Inner
+                    {
+                        public static int M() => {{first}};
+                    }
+                }
+                """;
+            var b = $$"""
+                public static class B
+                {
+                    public static class Inner
+                    {
+                        public static int M() => {{second}};
+                    }
+                }
+                """;
+            return "namespace DeltaFixture;\n\n" + (reverseOuterTypes ? b + "\n\n" + a : a + "\n\n" + b);
+        }
+
+        public static string ReorderedExpressionStatementsSource(int first, int second, bool reverseCalls)
+        {
+            var calls = reverseCalls
+                ? $"        LogB({second});\n        LogA({first});"
+                : $"        LogA({first});\n        LogB({second});";
+            return $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                    public static void Run()
+                    {
+                {{calls}}
+                    }
+
+                    private static void LogA(int value) { }
+                    private static void LogB(int value) { }
+                }
+                """;
+        }
 
         public void Dispose()
         {

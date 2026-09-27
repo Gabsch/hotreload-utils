@@ -170,7 +170,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             throw;
         }
         var outputAssembly = Path.GetFullPath(artifacts.BaselineOutputAsmPath);
-        var pdbPath = Path.ChangeExtension(outputAssembly, ".pdb");
+        var pdbPath = FindPortablePdbPath(outputAssembly);
         try
         {
             if (!File.Exists(pdbPath))
@@ -637,6 +637,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             {
                 MethodDeclarationSyntax method => "method:" + MethodIdentity(method),
                 LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
+                StatementSyntax statement => "statement:" + StatementIdentity(statement),
                 _ => null
             };
             if (identity is null)
@@ -672,6 +673,51 @@ public sealed class HotReloadDeltaSession : IDisposable
         var method = local.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
         var variables = string.Join(",", local.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
         return $"{(method is null ? string.Empty : MethodIdentity(method))}:{local.Declaration.Type.WithoutTrivia()}:{variables}";
+    }
+
+    private static string StatementIdentity(StatementSyntax statement)
+    {
+        var method = statement.Ancestors().OfType<MethodDeclarationSyntax>().FirstOrDefault();
+        var tokens = statement.DescendantTokens().Select(static token =>
+            token.Parent is LiteralExpressionSyntax
+                ? $"<{token.Kind()}>"
+                : token.ValueText);
+        return $"{(method is null ? string.Empty : MethodIdentity(method))}:{statement.Kind()}:{string.Join("|", tokens)}";
+    }
+
+    private static string FindPortablePdbPath(string assemblyPath)
+    {
+        using var stream = File.OpenRead(assemblyPath);
+        using var peReader = new PEReader(stream);
+        var embeddedCandidates = peReader.ReadDebugDirectory()
+            .Where(static entry => entry.Type == DebugDirectoryEntryType.CodeView)
+            .Select(entry => peReader.ReadCodeViewDebugDirectoryData(entry).Path)
+            .Where(static path => !string.IsNullOrWhiteSpace(path))
+            .Select(path => Path.GetFullPath(
+                Path.IsPathRooted(path)
+                    ? path
+                    : Path.Combine(Path.GetDirectoryName(assemblyPath)!, path)))
+            .Distinct(PathComparer)
+            .ToArray();
+        var existingEmbeddedCandidates = embeddedCandidates.Where(File.Exists).ToArray();
+        if (existingEmbeddedCandidates.Length == 1)
+        {
+            return existingEmbeddedCandidates[0];
+        }
+
+        var siblingPdb = Path.ChangeExtension(assemblyPath, ".pdb");
+        if (existingEmbeddedCandidates.Length == 0 && File.Exists(siblingPdb))
+        {
+            return siblingPdb;
+        }
+
+        if (embeddedCandidates.Length != 1)
+        {
+            throw new InvalidOperationException(
+                $"Expected exactly one portable PDB path in the baseline assembly debug directory, found {embeddedCandidates.Length}.");
+        }
+
+        return embeddedCandidates[0];
     }
 
     private async Task<FullPdbResult> EmitFullPdbAsync(
@@ -732,8 +778,11 @@ public sealed class HotReloadDeltaSession : IDisposable
             changedPaths,
             cancellationToken);
 
-        foreach (var methodGroup in oldPoints
-            .Where(point => !point.Hidden && changedPaths.Contains(Path.GetFullPath(point.FilePath)))
+        var resolvedOldPoints = ResolveChangedDocumentPoints(oldPoints, changedPaths, committedDocuments);
+        var resolvedNewPoints = ResolveChangedDocumentPoints(newPoints, changedPaths, updatedDocuments);
+
+        foreach (var methodGroup in resolvedOldPoints
+            .Where(static point => !point.Hidden)
             .GroupBy(point => point.MethodToken))
         {
             if (updatedMethodSet.Contains(methodGroup.Key))
@@ -741,7 +790,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 includesUpdatedMethods = true;
                 var updatedMapping = MapUpdatedMethod(
                     methodGroup.OrderBy(point => point.IlOffset).ToImmutableArray(),
-                    newPoints
+                    resolvedNewPoints
                         .Where(point => !point.Hidden && point.MethodToken == methodGroup.Key)
                         .OrderBy(point => point.IlOffset)
                         .ToImmutableArray(),
@@ -766,7 +815,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             foreach (var oldPoint in methodGroup)
             {
-                var matches = newPoints.Where(point =>
+                var matches = resolvedNewPoints.Where(point =>
                     !point.Hidden &&
                     point.MethodToken == oldPoint.MethodToken &&
                     point.IlOffset == oldPoint.IlOffset &&
@@ -800,6 +849,72 @@ public sealed class HotReloadDeltaSession : IDisposable
         return ExactLineUpdateResult.Ok(lineUpdates, includesUpdatedMethods);
     }
 
+    private static ImmutableArray<PortableSequencePoint> ResolveChangedDocumentPoints(
+        ImmutableArray<PortableSequencePoint> points,
+        HashSet<string> changedPaths,
+        Dictionary<string, DocumentSyntaxSnapshot> documents)
+    {
+        var documentChecksums = documents.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var result = ImmutableArray.CreateBuilder<PortableSequencePoint>();
+        foreach (var point in points)
+        {
+            var resolvedPath = ResolveChangedDocumentPath(
+                point.FilePath,
+                point.DocumentChecksum,
+                changedPaths,
+                documentChecksums);
+            if (resolvedPath is not null)
+            {
+                result.Add(point with { FilePath = resolvedPath });
+            }
+        }
+
+        return result.ToImmutable();
+    }
+
+    private static string? ResolveChangedDocumentPath(
+        string pdbDocumentPath,
+        ImmutableArray<byte> pdbDocumentChecksum,
+        IReadOnlySet<string> changedPaths,
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums)
+    {
+        var fullPath = TryGetFullPath(pdbDocumentPath);
+        var directMatches = changedPaths.Where(path => PathComparer.Equals(path, fullPath)).ToArray();
+        if (directMatches.Length == 1)
+        {
+            return directMatches[0];
+        }
+
+        if (pdbDocumentChecksum.IsDefaultOrEmpty)
+        {
+            return null;
+        }
+
+        var checksumMatches = documentChecksums
+            .Where(pair =>
+                changedPaths.Contains(pair.Key) &&
+                pdbDocumentChecksum.AsSpan().SequenceEqual(pair.Value.AsSpan()))
+            .Select(static pair => pair.Key)
+            .Distinct(PathComparer)
+            .ToArray();
+        return checksumMatches.Length == 1 ? checksumMatches[0] : null;
+    }
+
+    private static string? TryGetFullPath(string path)
+    {
+        try
+        {
+            return Path.GetFullPath(path);
+        }
+        catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
+        {
+            return null;
+        }
+    }
+
     private static async Task<Dictionary<string, DocumentSyntaxSnapshot>> ReadSyntaxDocumentsAsync(
         Project project,
         HashSet<string> changedPaths,
@@ -826,7 +941,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 throw new InvalidOperationException($"The syntax root is unavailable for '{path}'.");
             }
 
-            result.Add(path, new(root, text));
+            result.Add(path, new(path, root, text, text.GetChecksum()));
         }
 
         return result;
@@ -1055,7 +1170,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                     point.StartColumn,
                     point.EndLine - 1,
                     point.EndColumn,
-                    point.IsHidden));
+                    point.IsHidden,
+                    reader.GetBlobBytes(document.Hash).ToImmutableArray()));
             }
         }
 
@@ -1093,7 +1209,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         foreach (var typeHandle in reader.TypeDefinitions)
         {
             var type = reader.GetTypeDefinition(typeHandle);
-            var typeName = $"{reader.GetString(type.Namespace)}.{reader.GetString(type.Name)}";
+            var typeName = GetQualifiedTypeName(reader, typeHandle);
             foreach (var methodHandle in type.GetMethods())
             {
                 var method = reader.GetMethodDefinition(methodHandle);
@@ -1104,6 +1220,28 @@ public sealed class HotReloadDeltaSession : IDisposable
         }
 
         return result;
+    }
+
+    private static string GetQualifiedTypeName(MetadataReader reader, TypeDefinitionHandle typeHandle)
+    {
+        var names = new Stack<string>();
+        var current = typeHandle;
+        string? namespaceName = null;
+        while (!current.IsNil)
+        {
+            var type = reader.GetTypeDefinition(current);
+            names.Push(reader.GetString(type.Name));
+            var currentNamespace = reader.GetString(type.Namespace);
+            if (!string.IsNullOrEmpty(currentNamespace))
+            {
+                namespaceName = currentNamespace;
+            }
+
+            current = type.GetDeclaringType();
+        }
+
+        var nestedName = string.Join("+", names);
+        return string.IsNullOrEmpty(namespaceName) ? nestedName : $"{namespaceName}.{nestedName}";
     }
 
     private static string ContentHash(SourceText text) =>
@@ -1142,9 +1280,14 @@ public sealed class HotReloadDeltaSession : IDisposable
         int StartColumn,
         int EndLine,
         int EndColumn,
-        bool Hidden);
+        bool Hidden,
+        ImmutableArray<byte> DocumentChecksum);
 
-    private sealed record DocumentSyntaxSnapshot(SyntaxNode Root, SourceText Text);
+    private sealed record DocumentSyntaxSnapshot(
+        string FilePath,
+        SyntaxNode Root,
+        SourceText Text,
+        ImmutableArray<byte> Checksum);
 
     private sealed record SyntaxAnchor(string Kind, string Text);
 

@@ -389,10 +389,12 @@ static Guid ReadModuleId(string assemblyPath)
 
 static bool IsUnderRoot(string root, string path)
 {
-    var normalizedRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(root)) + Path.DirectorySeparatorChar;
-    return Path.GetFullPath(path).StartsWith(
-        normalizedRoot,
-        OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
+    var relativePath = Path.GetRelativePath(Path.GetFullPath(root), Path.GetFullPath(path));
+    return !Path.IsPathRooted(relativePath) &&
+        !string.Equals(relativePath, "..", StringComparison.Ordinal) &&
+        !relativePath.StartsWith(
+            ".." + Path.DirectorySeparatorChar,
+            OperatingSystem.IsWindows() ? StringComparison.OrdinalIgnoreCase : StringComparison.Ordinal);
 }
 
 static void EnsureArtifactPathUnderWorkspace(string workspaceRoot, string artifactDirectory)
