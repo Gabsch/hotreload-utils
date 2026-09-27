@@ -99,7 +99,7 @@ static async Task<object> StartSessionAsync(
     }
 
     var session = await HotReloadDeltaSession.StartAsync(
-        projectPath,
+        resolvedProjectPath,
         request.Configuration,
         request.TargetFramework,
         request.MsBuildProperties,
@@ -165,8 +165,9 @@ static async Task<object> PrepareUpdateAsync(
     var changes = request.ChangedDocuments.Select(document =>
     {
         var filePath = Path.GetFullPath(document.FilePath);
+        var resolvedFilePath = ResolvePathThroughExistingLinks(filePath);
         var extension = Path.GetExtension(filePath);
-        if (!IsUnderRoot(session.WorkspaceRoot, filePath) ||
+        if (!IsUnderRoot(session.WorkspaceRoot, resolvedFilePath) ||
             !string.Equals(extension, ".cs", StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(extension, ".razor", StringComparison.OrdinalIgnoreCase))
         {

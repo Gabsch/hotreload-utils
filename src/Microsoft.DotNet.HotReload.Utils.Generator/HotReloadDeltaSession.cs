@@ -238,6 +238,25 @@ public sealed class HotReloadDeltaSession : IDisposable
         foreach (var change in changes)
         {
             var path = Path.GetFullPath(change.FilePath);
+            var project = solution.GetProject(projectId)!;
+            var matchingDocuments = project.Documents
+                .Cast<TextDocument>()
+                .Concat(project.AdditionalDocuments)
+                .Where(candidate =>
+                    candidate.FilePath is not null &&
+                    PathsReferToSameFile(candidate.FilePath, path))
+                .ToArray();
+            if (matchingDocuments.Length == 1)
+            {
+                path = Path.GetFullPath(matchingDocuments[0].FilePath!);
+            }
+            else if (matchingDocuments.Length > 1)
+            {
+                throw new ArgumentException(
+                    $"A changed document path resolves to multiple project documents: {path}",
+                    nameof(changes));
+            }
+
             if (!changedPaths.Add(path))
             {
                 throw new ArgumentException(
@@ -251,7 +270,6 @@ public sealed class HotReloadDeltaSession : IDisposable
         var updatedSolution = solution;
         var changedFiles = ImmutableArray.CreateBuilder<string>(normalizedChanges.Count);
         var changedDocuments = ImmutableArray.CreateBuilder<HotReloadDeltaChangedDocumentEvidence>(normalizedChanges.Count);
-        var lineMovingFiles = new HashSet<string>(PathComparer);
         var hasTextChanges = false;
         foreach (var change in normalizedChanges)
         {
@@ -279,29 +297,11 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
-            var pdbProject = pdbSolution.GetProject(projectId)!;
-            TextDocument? pdbDocument = isAdditionalDocument
-                ? pdbProject.AdditionalDocuments.SingleOrDefault(candidate =>
-                    string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison))
-                : pdbProject.Documents.SingleOrDefault(candidate =>
-                    string.Equals(Path.GetFullPath(candidate.FilePath ?? string.Empty), path, PathComparison));
-            if (pdbDocument is null)
-            {
-                return RestartRequired(normalizedChanges, $"Document is not part of the portable-PDB baseline project: {path}");
-            }
-
-            var pdbText = await pdbDocument.GetTextAsync(cancellationToken);
-            if (!isAdditionalDocument &&
-                (ContainsLineDirective(pdbText) || ContainsLineDirective(newText)))
+            if (isAdditionalDocument && HasLineMovingChanges(oldText, newText))
             {
                 return RestartRequired(
                     normalizedChanges,
-                    "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
-            }
-
-            if (HasLineMovingChanges(pdbText, newText))
-            {
-                lineMovingFiles.Add(path);
+                    "Line-moving changes in generated or additional documents are ambiguous without exact portable-PDB identity evidence.");
             }
 
             updatedSolution = isAdditionalDocument
@@ -333,6 +333,17 @@ public sealed class HotReloadDeltaSession : IDisposable
                 LineUpdatesComplete: true,
                 []);
         }
+
+        var lineMovement = await AnalyzeLineMovementAsync(
+            pdbSolution.GetProject(projectId)!,
+            updatedSolution.GetProject(projectId)!,
+            cancellationToken);
+        if (!lineMovement.Success)
+        {
+            return RestartRequired(normalizedChanges, lineMovement.Error!);
+        }
+
+        var lineMovingFiles = lineMovement.Files.ToHashSet(PathComparer);
 
         var updates = await hotReloadService.GetUpdatesAsync(
             updatedSolution,
@@ -606,6 +617,42 @@ public sealed class HotReloadDeltaSession : IDisposable
             .DescendantTrivia(descendIntoTrivia: true)
             .Any(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia));
 
+    private static async Task<LineMovementAnalysisResult> AnalyzeLineMovementAsync(
+        Project pdbProject,
+        Project updatedProject,
+        CancellationToken cancellationToken)
+    {
+        var lineMovingFiles = ImmutableArray.CreateBuilder<string>();
+        foreach (var updatedDocument in updatedProject.Documents)
+        {
+            var pdbDocument = pdbProject.GetDocument(updatedDocument.Id);
+            if (pdbDocument is null || updatedDocument.FilePath is null)
+            {
+                continue;
+            }
+
+            var pdbText = await pdbDocument.GetTextAsync(cancellationToken);
+            var updatedText = await updatedDocument.GetTextAsync(cancellationToken);
+            if (pdbText.ContentEquals(updatedText))
+            {
+                continue;
+            }
+
+            if (ContainsLineDirective(pdbText) || ContainsLineDirective(updatedText))
+            {
+                return LineMovementAnalysisResult.Fail(
+                    "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
+            }
+
+            if (HasLineMovingChanges(pdbText, updatedText))
+            {
+                lineMovingFiles.Add(Path.GetFullPath(updatedDocument.FilePath));
+            }
+        }
+
+        return LineMovementAnalysisResult.Ok(lineMovingFiles.ToImmutable());
+    }
+
     private static bool HasLineMovingChanges(SourceText oldText, SourceText newText)
     {
         var oldPositions = GetLinePositions(oldText);
@@ -835,35 +882,66 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static string FindPortablePdbPath(string assemblyPath, ImmutableArray<byte> peImage)
     {
         using var peReader = new PEReader(peImage);
-        var embeddedCandidates = peReader.ReadDebugDirectory()
+        var references = peReader.ReadDebugDirectory()
             .Where(static entry => entry.Type == DebugDirectoryEntryType.CodeView)
-            .Select(entry => peReader.ReadCodeViewDebugDirectoryData(entry).Path)
-            .Where(static path => !string.IsNullOrWhiteSpace(path))
-            .Select(path => Path.GetFullPath(
-                Path.IsPathRooted(path)
-                    ? path
-                    : Path.Combine(Path.GetDirectoryName(assemblyPath)!, path)))
+            .Select(entry =>
+            {
+                var data = peReader.ReadCodeViewDebugDirectoryData(entry);
+                var path = Path.GetFullPath(
+                    Path.IsPathRooted(data.Path)
+                        ? data.Path
+                        : Path.Combine(Path.GetDirectoryName(assemblyPath)!, data.Path));
+                return new PortablePdbReference(path, data.Guid, entry.Stamp);
+            })
+            .ToArray();
+        var matchingReferencedPaths = references
+            .Where(reference =>
+                File.Exists(reference.Path) &&
+                PortablePdbMatches(reference.Path, [reference]))
+            .Select(static reference => reference.Path)
             .Distinct(PathComparer)
             .ToArray();
-        var existingEmbeddedCandidates = embeddedCandidates.Where(File.Exists).ToArray();
-        if (existingEmbeddedCandidates.Length == 1)
+        if (matchingReferencedPaths.Length == 1)
         {
-            return existingEmbeddedCandidates[0];
+            return matchingReferencedPaths[0];
         }
 
         var siblingPdb = Path.ChangeExtension(assemblyPath, ".pdb");
-        if (existingEmbeddedCandidates.Length == 0 && File.Exists(siblingPdb))
+        if (matchingReferencedPaths.Length == 0 &&
+            references.Length > 0 &&
+            File.Exists(siblingPdb) &&
+            PortablePdbMatches(siblingPdb, references))
         {
             return siblingPdb;
         }
 
-        if (embeddedCandidates.Length != 1)
-        {
-            throw new InvalidOperationException(
-                $"Expected exactly one portable PDB path in the baseline assembly debug directory, found {embeddedCandidates.Length}.");
-        }
+        throw new InvalidOperationException(
+            "The baseline assembly does not identify exactly one matching external portable PDB.");
+    }
 
-        return embeddedCandidates[0];
+    private static bool PortablePdbMatches(
+        string pdbPath,
+        IReadOnlyList<PortablePdbReference> references)
+    {
+        try
+        {
+            using var stream = File.OpenRead(pdbPath);
+            using var provider = MetadataReaderProvider.FromPortablePdbStream(stream);
+            var header = provider.GetMetadataReader().DebugMetadataHeader;
+            if (header is null)
+            {
+                return false;
+            }
+
+            var contentId = new BlobContentId(header.Id);
+            return references.Any(reference =>
+                reference.Guid == contentId.Guid &&
+                reference.Stamp == contentId.Stamp);
+        }
+        catch (Exception exception) when (exception is IOException or BadImageFormatException)
+        {
+            return false;
+        }
     }
 
     private static Guid ReadModuleId(ImmutableArray<byte> peImage)
@@ -933,6 +1011,18 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         var resolvedOldPoints = ResolveChangedDocumentPoints(oldPoints, changedPaths, committedDocuments);
         var resolvedNewPoints = ResolveChangedDocumentPoints(newPoints, changedPaths, updatedDocuments);
+        var unresolvedOldPaths = FindMissingPaths(
+            changedPaths,
+            resolvedOldPoints.Select(static point => point.FilePath));
+        var unresolvedNewPaths = FindMissingPaths(
+            changedPaths,
+            resolvedNewPoints.Select(static point => point.FilePath));
+        if (!unresolvedOldPaths.IsEmpty || !unresolvedNewPaths.IsEmpty)
+        {
+            var unresolvedPaths = unresolvedOldPaths.Concat(unresolvedNewPaths).Distinct(PathComparer);
+            return ExactLineUpdateResult.Fail(
+                $"Exact sequence-point relocation could not resolve every line-moving document: {string.Join(", ", unresolvedPaths)}");
+        }
 
         foreach (var methodGroup in resolvedOldPoints
             .Where(static point => !point.Hidden)
@@ -993,13 +1083,27 @@ public sealed class HotReloadDeltaSession : IDisposable
                 .OrderBy(static pair => pair.Key)
                 .Select(pair => new HotReloadDeltaLineUpdate(mapping.Key, pair.Value, pair.Key)))
             .ToImmutableArray();
-        if (lineUpdates.IsEmpty)
+        var pathsWithoutUpdates = FindMissingPaths(
+            changedPaths,
+            lineUpdates.Select(static update => update.FilePath));
+        if (!pathsWithoutUpdates.IsEmpty)
         {
             return ExactLineUpdateResult.Fail(
-                "The source contains line-moving changes, but no exact sequence-point relocation was produced.");
+                $"The source contains line-moving changes, but no exact sequence-point relocation was produced for: {string.Join(", ", pathsWithoutUpdates)}");
         }
 
         return ExactLineUpdateResult.Ok(lineUpdates, includesUpdatedMethods);
+    }
+
+    private static ImmutableArray<string> FindMissingPaths(
+        IEnumerable<string> requiredPaths,
+        IEnumerable<string> observedPaths)
+    {
+        var observed = observedPaths.ToHashSet(PathComparer);
+        return requiredPaths
+            .Where(path => !observed.Contains(path))
+            .Distinct(PathComparer)
+            .ToImmutableArray();
     }
 
     private static ImmutableArray<PortableSequencePoint> ResolveChangedDocumentPoints(
@@ -1066,6 +1170,39 @@ public sealed class HotReloadDeltaSession : IDisposable
         {
             return null;
         }
+    }
+
+    private static bool PathsReferToSameFile(string first, string second) =>
+        PathComparer.Equals(
+            ResolvePathThroughExistingLinks(first),
+            ResolvePathThroughExistingLinks(second));
+
+    private static string ResolvePathThroughExistingLinks(string path)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var root = Path.GetPathRoot(fullPath)
+            ?? throw new InvalidOperationException($"Path does not have a filesystem root: {path}");
+        var current = root;
+        foreach (var segment in fullPath[root.Length..].Split(
+            [Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar],
+            StringSplitOptions.RemoveEmptyEntries))
+        {
+            var candidate = Path.Combine(current, segment);
+            FileSystemInfo? info = Directory.Exists(candidate)
+                ? new DirectoryInfo(candidate)
+                : File.Exists(candidate)
+                    ? new FileInfo(candidate)
+                    : null;
+            if (info is null)
+            {
+                current = candidate;
+                continue;
+            }
+
+            current = Path.GetFullPath(info.ResolveLinkTarget(returnFinalTarget: true)?.FullName ?? info.FullName);
+        }
+
+        return current;
     }
 
     private static async Task<Dictionary<string, DocumentSyntaxSnapshot>> ReadSyntaxDocumentsAsync(
@@ -1520,6 +1657,8 @@ public sealed class HotReloadDeltaSession : IDisposable
         bool Hidden,
         ImmutableArray<byte> DocumentChecksum);
 
+    private sealed record PortablePdbReference(string Path, Guid Guid, uint Stamp);
+
     private sealed record DocumentSyntaxSnapshot(
         string FilePath,
         SyntaxNode Root,
@@ -1555,6 +1694,18 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         public static ExactLineUpdateResult Fail(string error) =>
             new(false, [], false, error);
+    }
+
+    private sealed record LineMovementAnalysisResult(
+        bool Success,
+        ImmutableArray<string> Files,
+        string? Error)
+    {
+        public static LineMovementAnalysisResult Ok(ImmutableArray<string> files) =>
+            new(true, files, null);
+
+        public static LineMovementAnalysisResult Fail(string error) =>
+            new(false, [], error);
     }
 
     private sealed record FullPdbResult(

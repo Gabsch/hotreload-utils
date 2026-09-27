@@ -216,6 +216,48 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_DetectsLineMovementDebtOutsideCurrentChangedFile()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.Source(1),
+            cancellationToken,
+            additionalSource: ProjectFixture.SecondaryActiveSource(2));
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+        var pdbSolution = ReadSessionSolution(session, "pdbSolution");
+        var updatedSolution = ReadSessionSolution(session, "solution");
+        var sourceDocument = updatedSolution.Projects
+            .SelectMany(static project => project.Documents)
+            .Single(document => document.FilePath == fixture.SourcePath);
+        var secondaryDocument = updatedSolution.Projects
+            .SelectMany(static project => project.Documents)
+            .Single(document => document.FilePath == fixture.SecondaryPath);
+        updatedSolution = updatedSolution
+            .WithDocumentText(sourceDocument.Id, SourceText.From(ProjectFixture.SourceWithLineShift(1)))
+            .WithDocumentText(secondaryDocument.Id, SourceText.From(ProjectFixture.SecondaryActiveSource(3)));
+        var analyzer = typeof(HotReloadDeltaSession).GetMethod(
+            "AnalyzeLineMovementAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var task = (Task)analyzer.Invoke(null, [
+            pdbSolution.GetProject(sourceDocument.Project.Id)!,
+            updatedSolution.GetProject(sourceDocument.Project.Id)!,
+            cancellationToken
+        ])!;
+        await task;
+        var result = task.GetType().GetProperty("Result")!.GetValue(task)!;
+        var files = (ImmutableArray<string>)result.GetType().GetProperty("Files")!.GetValue(result)!;
+
+        Assert.Contains(fixture.SourcePath, files);
+        Assert.DoesNotContain(fixture.SecondaryPath, files);
+    }
+
+    [Fact]
     public async Task Session_AllowsTrailingCommentWithoutSequencePointMovement()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -714,6 +756,35 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_PortablePdbLookupRejectsFileThatDoesNotMatchBaselineAssembly()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(ProjectFixture.Source(1), cancellationToken);
+        using var otherFixture = await RazorProjectFixture.CreateAsync(cancellationToken);
+        var assemblyPath = Path.Combine(fixture.Root, "bin", "Debug", "net10.0", "DeltaFixture.dll");
+        var pdbPath = ReadCodeViewPath(assemblyPath);
+        var siblingPdbPath = Path.ChangeExtension(assemblyPath, ".pdb");
+        var otherPdbPath = Path.Combine(otherFixture.Root, "bin", "Debug", "net10.0", "RazorDeltaFixture.pdb");
+        File.Copy(otherPdbPath, pdbPath, overwrite: true);
+        if (!string.Equals(pdbPath, siblingPdbPath, StringComparison.OrdinalIgnoreCase))
+        {
+            File.Copy(otherPdbPath, siblingPdbPath, overwrite: true);
+        }
+
+        var finder = typeof(HotReloadDeltaSession).GetMethod(
+            "FindPortablePdbPath",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var assemblyBytes = (await File.ReadAllBytesAsync(assemblyPath, cancellationToken)).ToImmutableArray();
+        var exception = Assert.Throws<TargetInvocationException>(() => finder.Invoke(null, [
+            assemblyPath,
+            assemblyBytes
+        ]));
+
+        var mismatch = Assert.IsType<InvalidOperationException>(exception.InnerException);
+        Assert.Contains("matching external portable PDB", mismatch.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Session_ReleasesWorkspaceWhenBaselinePdbIsMissing()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -815,6 +886,20 @@ public sealed class HotReloadDeltaSessionTests
         ]);
 
         Assert.Equal(fixture.SourcePath, resolvedPath);
+    }
+
+    [Fact]
+    public void Session_RequiresCoverageForEveryLineMovingDocument()
+    {
+        var finder = typeof(HotReloadDeltaSession).GetMethod(
+            "FindMissingPaths",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var missing = (ImmutableArray<string>)finder.Invoke(null, [
+            new[] { "first.cs", "second.cs", "third.cs" },
+            new[] { "third.cs" }
+        ])!;
+
+        Assert.Equal(["first.cs", "second.cs"], missing);
     }
 
     [Fact]
@@ -1234,8 +1319,10 @@ public sealed class HotReloadDeltaSessionTests
         }
     }
 
-    [Fact]
-    public async Task Worker_RetainsResolvedWorkspaceRootForLaterRequests()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Worker_RetainsResolvedWorkspaceRootForLaterRequests(bool useAliasPaths)
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
@@ -1261,13 +1348,22 @@ public sealed class HotReloadDeltaSessionTests
             var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
             try
             {
+                var projectPath = useAliasPaths
+                    ? Path.Combine(aliasRoot, Path.GetFileName(fixture.ProjectPath))
+                    : fixture.ProjectPath;
+                var sourcePath = useAliasPaths
+                    ? Path.Combine(aliasRoot, Path.GetFileName(fixture.SourcePath))
+                    : fixture.SourcePath;
+                var artifactDirectory = useAliasPaths
+                    ? Path.Combine(aliasRoot, "artifacts")
+                    : Path.Combine(fixture.Root, "artifacts");
                 var started = await SendWorkerRequestAsync(
                     worker,
                     "start",
                     "startSession",
                     new
                     {
-                        projectPath = fixture.ProjectPath,
+                        projectPath,
                         workspaceRoot = aliasRoot,
                         configuration = "Debug",
                         targetFramework = "net10.0",
@@ -1290,12 +1386,18 @@ public sealed class HotReloadDeltaSessionTests
                         sessionId,
                         changedDocuments = new[]
                         {
-                            new { filePath = fixture.SourcePath, text = ProjectFixture.Source(2) }
+                            new
+                            {
+                                filePath = sourcePath,
+                                text = ProjectFixture.Source(2)
+                            }
                         },
-                        artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                        artifactDirectory
                     },
                     cancellationToken);
                 Assert.True(prepared.GetProperty("success").GetBoolean(), prepared.ToString());
+                var artifacts = prepared.GetProperty("result").GetProperty("artifacts");
+                Assert.True(artifacts.GetArrayLength() > 0, prepared.ToString());
                 var updateId = prepared.GetProperty("result").GetProperty("updateId").GetString()!;
 
                 var discarded = await SendWorkerRequestAsync(
@@ -1413,6 +1515,18 @@ public sealed class HotReloadDeltaSessionTests
     private static int FindLine(string source, string text) =>
         Array.FindIndex(source.Split('\n'), line => line.Contains(text, StringComparison.Ordinal));
 
+    private static string ReadCodeViewPath(string assemblyPath)
+    {
+        using var stream = File.OpenRead(assemblyPath);
+        using var reader = new PEReader(stream);
+        var entry = reader.ReadDebugDirectory().Single(candidate => candidate.Type == DebugDirectoryEntryType.CodeView);
+        var path = reader.ReadCodeViewDebugDirectoryData(entry).Path;
+        return Path.GetFullPath(
+            Path.IsPathRooted(path)
+                ? path
+                : Path.Combine(Path.GetDirectoryName(assemblyPath)!, path));
+    }
+
     private static bool DetectLineMovement(string baseline, string updated)
     {
         var detector = typeof(HotReloadDeltaSession).GetMethod(
@@ -1437,6 +1551,16 @@ public sealed class HotReloadDeltaSessionTests
             .SelectMany(static project => project.Documents)
             .Single(candidate => string.Equals(candidate.FilePath, filePath, StringComparison.OrdinalIgnoreCase));
         return (await document.GetTextAsync(TestContext.Current.CancellationToken)).ToString();
+    }
+
+    private static Microsoft.CodeAnalysis.Solution ReadSessionSolution(
+        HotReloadDeltaSession session,
+        string fieldName)
+    {
+        var field = typeof(HotReloadDeltaSession).GetField(
+            fieldName,
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        return (Microsoft.CodeAnalysis.Solution)field.GetValue(session)!;
     }
 
     private sealed class RazorProjectFixture : IDisposable
