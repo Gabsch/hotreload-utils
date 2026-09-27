@@ -334,16 +334,16 @@ public sealed class HotReloadDeltaSession : IDisposable
                 []);
         }
 
-        var lineMovement = await AnalyzeLineMovementAsync(
+        var runtimeDocumentChanges = await AnalyzeRuntimeDocumentChangesAsync(
             pdbSolution.GetProject(projectId)!,
             updatedSolution.GetProject(projectId)!,
             cancellationToken);
-        if (!lineMovement.Success)
+        if (!runtimeDocumentChanges.Success)
         {
-            return RestartRequired(normalizedChanges, lineMovement.Error!);
+            return RestartRequired(normalizedChanges, runtimeDocumentChanges.Error!);
         }
 
-        var lineMovingFiles = lineMovement.Files.ToHashSet(PathComparer);
+        var runtimeChangedFiles = runtimeDocumentChanges.Files.ToHashSet(PathComparer);
 
         var updates = await hotReloadService.GetUpdatesAsync(
             updatedSolution,
@@ -451,13 +451,13 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
             var includesUpdatedMethodMappings = false;
-            if (lineMovingFiles.Count > 0)
+            if (runtimeChangedFiles.Count > 0)
             {
                 var mapping = await CreateExactLineUpdatesAsync(
                     pdbSolution.GetProject(projectId)!,
                     updatedSolution.GetProject(projectId)!,
                     fullPdb.Pdb,
-                    lineMovingFiles.ToImmutableArray(),
+                    runtimeChangedFiles.ToImmutableArray(),
                     updatedMethods,
                     cancellationToken);
                 if (!mapping.Success)
@@ -487,7 +487,7 @@ public sealed class HotReloadDeltaSession : IDisposable
                 update.RequiredCapabilities,
                 diagnostics,
                 LineUpdatesComplete: true,
-                lineMovingFiles.Count > 0
+                !lineUpdates.IsEmpty
                     ? [includesUpdatedMethodMappings
                         ? "Exact sequence-point updates were derived from committed and updated source/PDB evidence, including updated methods."
                         : "Exact sequence-point updates were derived from committed and updated portable PDBs for unchanged methods."]
@@ -617,12 +617,12 @@ public sealed class HotReloadDeltaSession : IDisposable
             .DescendantTrivia(descendIntoTrivia: true)
             .Any(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia));
 
-    private static async Task<LineMovementAnalysisResult> AnalyzeLineMovementAsync(
+    private static async Task<RuntimeDocumentChangeAnalysisResult> AnalyzeRuntimeDocumentChangesAsync(
         Project pdbProject,
         Project updatedProject,
         CancellationToken cancellationToken)
     {
-        var lineMovingFiles = ImmutableArray.CreateBuilder<string>();
+        var changedFiles = ImmutableArray.CreateBuilder<string>();
         foreach (var updatedDocument in updatedProject.Documents)
         {
             var pdbDocument = pdbProject.GetDocument(updatedDocument.Id);
@@ -640,17 +640,14 @@ public sealed class HotReloadDeltaSession : IDisposable
 
             if (ContainsLineDirective(pdbText) || ContainsLineDirective(updatedText))
             {
-                return LineMovementAnalysisResult.Fail(
+                return RuntimeDocumentChangeAnalysisResult.Fail(
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
             }
 
-            if (HasLineMovingChanges(pdbText, updatedText))
-            {
-                lineMovingFiles.Add(Path.GetFullPath(updatedDocument.FilePath));
-            }
+            changedFiles.Add(Path.GetFullPath(updatedDocument.FilePath));
         }
 
-        return LineMovementAnalysisResult.Ok(lineMovingFiles.ToImmutable());
+        return RuntimeDocumentChangeAnalysisResult.Ok(changedFiles.ToImmutable());
     }
 
     private static bool HasLineMovingChanges(SourceText oldText, SourceText newText)
@@ -1083,15 +1080,6 @@ public sealed class HotReloadDeltaSession : IDisposable
                 .OrderBy(static pair => pair.Key)
                 .Select(pair => new HotReloadDeltaLineUpdate(mapping.Key, pair.Value, pair.Key)))
             .ToImmutableArray();
-        var pathsWithoutUpdates = FindMissingPaths(
-            changedPaths,
-            lineUpdates.Select(static update => update.FilePath));
-        if (!pathsWithoutUpdates.IsEmpty)
-        {
-            return ExactLineUpdateResult.Fail(
-                $"The source contains line-moving changes, but no exact sequence-point relocation was produced for: {string.Join(", ", pathsWithoutUpdates)}");
-        }
-
         return ExactLineUpdateResult.Ok(lineUpdates, includesUpdatedMethods);
     }
 
@@ -1696,15 +1684,15 @@ public sealed class HotReloadDeltaSession : IDisposable
             new(false, [], false, error);
     }
 
-    private sealed record LineMovementAnalysisResult(
+    private sealed record RuntimeDocumentChangeAnalysisResult(
         bool Success,
         ImmutableArray<string> Files,
         string? Error)
     {
-        public static LineMovementAnalysisResult Ok(ImmutableArray<string> files) =>
+        public static RuntimeDocumentChangeAnalysisResult Ok(ImmutableArray<string> files) =>
             new(true, files, null);
 
-        public static LineMovementAnalysisResult Fail(string error) =>
+        public static RuntimeDocumentChangeAnalysisResult Fail(string error) =>
             new(false, [], error);
     }
 

@@ -216,7 +216,7 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
-    public async Task Session_DetectsLineMovementDebtOutsideCurrentChangedFile()
+    public async Task Session_CollectsRuntimeDivergenceOutsideCurrentChangedFile()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
         using var fixture = await ProjectFixture.CreateAsync(
@@ -242,7 +242,7 @@ public sealed class HotReloadDeltaSessionTests
             .WithDocumentText(sourceDocument.Id, SourceText.From(ProjectFixture.SourceWithLineShift(1)))
             .WithDocumentText(secondaryDocument.Id, SourceText.From(ProjectFixture.SecondaryActiveSource(3)));
         var analyzer = typeof(HotReloadDeltaSession).GetMethod(
-            "AnalyzeLineMovementAsync",
+            "AnalyzeRuntimeDocumentChangesAsync",
             BindingFlags.NonPublic | BindingFlags.Static)!;
         var task = (Task)analyzer.Invoke(null, [
             pdbSolution.GetProject(sourceDocument.Project.Id)!,
@@ -254,7 +254,7 @@ public sealed class HotReloadDeltaSessionTests
         var files = (ImmutableArray<string>)result.GetType().GetProperty("Files")!.GetValue(result)!;
 
         Assert.Contains(fixture.SourcePath, files);
-        Assert.DoesNotContain(fixture.SecondaryPath, files);
+        Assert.Contains(fixture.SecondaryPath, files);
     }
 
     [Fact]
@@ -358,7 +358,7 @@ public sealed class HotReloadDeltaSessionTests
 
         var update = await session.PrepareUpdateAsync([
             new(fixture.SourcePath, ProjectFixture.SourceWithLineShift(2)),
-            new(fixture.SecondaryPath, ProjectFixture.SecondaryActiveSourceWithoutSeed(3))
+            new(fixture.SecondaryPath, ProjectFixture.SecondaryActiveSource(3))
         ], cancellationToken);
 
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
@@ -366,6 +366,33 @@ public sealed class HotReloadDeltaSessionTests
         Assert.All(update.LineUpdates, lineUpdate => Assert.Equal(fixture.SourcePath, lineUpdate.FilePath));
         Assert.Contains(fixture.SecondaryPath, update.ChangedFiles);
         session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_RequiresRestartWhenUpdatedMethodSequencePointIsDeleted()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.Source(1),
+            cancellationToken,
+            additionalSource: ProjectFixture.SecondaryActiveSource(2));
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SecondaryPath, ProjectFixture.SecondaryActiveSourceWithoutSeed(3))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Contains(update.Warnings, warning =>
+            warning.Contains("ambiguous sequence-point mapping", StringComparison.Ordinal));
+        Assert.False(session.HasPendingUpdate);
     }
 
     [Fact]
@@ -392,6 +419,57 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Contains(update.LineUpdates, lineUpdate =>
             lineUpdate.OldLine == FindLine(baseline, "public static int Unchanged()") &&
             lineUpdate.NewLine == FindLine(updated, "public static int Unchanged()"));
+        session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_MapsMovedChangedStatementWithoutStableTextIdentity()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = ProjectFixture.MovedChangedStatementSource(updated: false);
+        var updated = ProjectFixture.MovedChangedStatementSource(updated: true);
+        using var fixture = await ProjectFixture.CreateAsync(baseline, cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, updated)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.Contains(update.LineUpdates, lineUpdate =>
+            lineUpdate.OldLine == FindLine(baseline, "F();") &&
+            lineUpdate.NewLine == FindLine(updated, "G();"));
+        session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_IgnoresNonExecutableLinePermutationDuringLineStableUpdate()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var baseline = ProjectFixture.BlankPermutationSource(1, updated: false);
+        var updated = ProjectFixture.BlankPermutationSource(2, updated: true);
+        Assert.True(DetectLineMovement(baseline, updated));
+        using var fixture = await ProjectFixture.CreateAsync(baseline, cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, updated)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
+        Assert.Empty(update.LineUpdates);
         session.DiscardUpdate();
     }
 
@@ -1247,6 +1325,86 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Worker_RejectsAllowedLookingSymlinkToUnsupportedDocumentExtension()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(cancellationToken);
+        var targetPath = Path.Combine(fixture.Root, "settings.txt");
+        var linkPath = Path.Combine(fixture.Root, "settings.cs");
+        await File.WriteAllTextAsync(targetPath, "baseline", cancellationToken);
+        try
+        {
+            File.CreateSymbolicLink(linkPath, targetPath);
+        }
+        catch (Exception exception) when (exception is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        {
+            Assert.Skip($"Symbolic links are unavailable in this test environment: {exception.Message}");
+            return;
+        }
+
+        using var worker = StartWorker();
+        var stderr = worker.StandardError.ReadToEndAsync(cancellationToken);
+        try
+        {
+            var started = await SendWorkerRequestAsync(
+                worker,
+                "start",
+                "startSession",
+                new
+                {
+                    projectPath = fixture.ProjectPath,
+                    workspaceRoot = fixture.Root,
+                    configuration = "Debug",
+                    targetFramework = "net10.0",
+                    msBuildProperties = (object?)null,
+                    runtimeCapabilities = new[] { "Baseline" }
+                },
+                cancellationToken);
+            Assert.True(started.GetProperty("success").GetBoolean(), started.ToString());
+            var sessionId = started.GetProperty("result").GetProperty("sessionId").GetString()!;
+
+            var rejected = await SendWorkerRequestAsync(
+                worker,
+                "prepare",
+                "prepareUpdate",
+                new
+                {
+                    sessionId,
+                    changedDocuments = new[]
+                    {
+                        new { filePath = linkPath, text = "changed" }
+                    },
+                    artifactDirectory = Path.Combine(fixture.Root, "artifacts")
+                },
+                cancellationToken);
+            Assert.False(rejected.GetProperty("success").GetBoolean());
+            Assert.Equal(
+                "hot_reload_document_invalid",
+                rejected.GetProperty("error").GetProperty("code").GetString());
+
+            var ended = await SendWorkerRequestAsync(
+                worker,
+                "end",
+                "endSession",
+                new { sessionId },
+                cancellationToken);
+            Assert.True(ended.GetProperty("success").GetBoolean(), ended.ToString());
+
+            worker.StandardInput.Close();
+            await worker.WaitForExitAsync(cancellationToken);
+            Assert.True(worker.ExitCode == 0, await stderr);
+        }
+        finally
+        {
+            if (!worker.HasExited)
+            {
+                worker.Kill(entireProcessTree: true);
+                await worker.WaitForExitAsync(CancellationToken.None);
+            }
+        }
+    }
+
+    [Fact]
     public async Task Worker_AcceptsFilesystemRootAsWorkspaceRoot()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -1779,6 +1937,62 @@ public sealed class HotReloadDeltaSessionTests
                 "    public static int Unchanged()",
                 "    // inserted line\n    public static int Unchanged()",
                 StringComparison.Ordinal);
+
+        public static string MovedChangedStatementSource(bool updated) => updated
+            ? """
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                    public static int Run()
+                    {
+                        G();
+                        // new
+                        return 1;
+                    }
+
+                    private static void F() { }
+                    private static void G() { }
+                }
+                """
+            : """
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                    public static int Run()
+                    {
+                        // old
+                        F();
+                        return 1;
+                    }
+
+                    private static void F() { }
+                    private static void G() { }
+                }
+                """;
+
+        public static string BlankPermutationSource(int value, bool updated) => updated
+            ? $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+
+                    // marker
+                    public static int Value() => {{value}};
+                }
+                """
+            : $$"""
+                namespace DeltaFixture;
+
+                public static class Calculator
+                {
+                    // marker
+
+                    public static int Value() => {{value}};
+                }
+                """;
 
         public static string ExpressionLambdaSource(bool fieldLambda, bool shifted)
         {

@@ -166,7 +166,7 @@ static async Task<object> PrepareUpdateAsync(
     {
         var filePath = Path.GetFullPath(document.FilePath);
         var resolvedFilePath = ResolvePathThroughExistingLinks(filePath);
-        var extension = Path.GetExtension(filePath);
+        var extension = Path.GetExtension(resolvedFilePath);
         if (!IsUnderRoot(session.WorkspaceRoot, resolvedFilePath) ||
             !string.Equals(extension, ".cs", StringComparison.OrdinalIgnoreCase) &&
             !string.Equals(extension, ".razor", StringComparison.OrdinalIgnoreCase))
