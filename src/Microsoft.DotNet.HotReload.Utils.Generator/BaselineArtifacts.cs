@@ -3,6 +3,7 @@
 
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.ExternalAccess.HotReload.Api;
+using Microsoft.CodeAnalysis.MSBuild;
 
 namespace Microsoft.DotNet.HotReload.Utils.Generator;
 
@@ -13,4 +14,4 @@ namespace Microsoft.DotNet.HotReload.Utils.Generator;
 /// BaselineOutputAsmPath: absolute path of the baseline assembly
 /// DocResolver: a map from document ids to documents
 /// ChangeMakerService: A stateful encapsulatio of the series of changes that have been made to the baseline
-internal record struct BaselineArtifacts (Solution BaselineSolution, ProjectId BaselineProjectId, string BaselineOutputAsmPath, DocResolver DocResolver, HotReloadService HotReloadService);
+internal record struct BaselineArtifacts (Solution BaselineSolution, ProjectId BaselineProjectId, string BaselineOutputAsmPath, DocResolver DocResolver, HotReloadService HotReloadService, MSBuildWorkspace Workspace);

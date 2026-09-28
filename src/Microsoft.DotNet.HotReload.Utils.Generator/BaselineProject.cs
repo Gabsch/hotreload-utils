@@ -17,14 +17,14 @@ using System.Collections.Immutable;
 
 namespace Microsoft.DotNet.HotReload.Utils.Generator;
 
-internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotReloadService HotReloadService) {
+internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotReloadService HotReloadService, MSBuildWorkspace Workspace) {
 
     public static async Task<BaselineProject> Make (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default) {
-        (var changeMakerService, var solution, var projectId) = await PrepareMSBuildProject(config, capabilities, ct);
-        return new BaselineProject(solution, projectId, changeMakerService);
+        (var changeMakerService, var solution, var projectId, var workspace) = await PrepareMSBuildProject(config, capabilities, ct);
+        return new BaselineProject(solution, projectId, changeMakerService, workspace);
     }
 
-    static async Task<(HotReloadService, Solution, ProjectId)> PrepareMSBuildProject (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default)
+    static async Task<(HotReloadService, Solution, ProjectId, MSBuildWorkspace)> PrepareMSBuildProject (Config config, EnC.EditAndContinueCapabilities capabilities, CancellationToken ct = default)
     {
         // https://stackoverflow.com/questions/43386267/roslyn-project-configuration says I have to specify at least a Configuration property
         // to get an output path, is that true?
@@ -46,43 +46,63 @@ internal record BaselineProject (Solution Solution, ProjectId ProjectId, HotRelo
             Parameters = "/tmp/enc.binlog"
         };
 #endif
-        var project = await workspace.OpenProjectAsync (config.ProjectPath, logger, null, ct);
+        try {
+            var project = await workspace.OpenProjectAsync (config.ProjectPath, logger, null, ct);
 
-        var service = new HotReloadService(
-            workspace.CurrentSolution.Services,
-            () => new([.. capabilities.ToString().Split(", ")]));
+            var service = new HotReloadService(
+                workspace.CurrentSolution.Services,
+                () => new([.. capabilities.ToString().Split(", ")]));
 
-        return (service, workspace.CurrentSolution, project.Id);
+            return (service, workspace.CurrentSolution, project.Id, workspace);
+        }
+        catch {
+            workspace.Dispose();
+            throw;
+        }
     }
 
 
     public async Task<BaselineArtifacts> PrepareBaseline (CancellationToken ct = default) {
-        await HotReloadService.StartSessionAsync(Solution, ct);
-        var project = Solution.GetProject(ProjectId)!;
+        var sessionStarted = false;
+        try {
+            await HotReloadService.StartSessionAsync(Solution, ct);
+            sessionStarted = true;
+            var project = Solution.GetProject(ProjectId)!;
+            if (!ConsumeBaseline (project, out string? outputAsm))
+                throw new InvalidOperationException ("could not consume baseline");
 
-        // gets a snapshot of the text of the baseline document in memory
-        // without this, roslyn doesn't appear to read the text until
-        // the document is really needed for the first time (when building a delta),
-        // at which point it may have already been changed on disk to a newer version.
-        var t = Task.Run (async () => {
-            foreach (var doc in project.Documents) {
-                await doc.GetTextAsync();
-                if (ct.IsCancellationRequested)
-                    break;
+            // Capture every baseline document before returning the session. Roslyn otherwise
+            // may read a document lazily after its on-disk contents have already changed.
+            foreach (var doc in project.Documents.Concat<TextDocument>(project.AdditionalDocuments))
+                await doc.GetTextAsync(ct);
+
+            foreach (var doc in await project.GetSourceGeneratedDocumentsAsync(ct))
+                await doc.GetTextAsync(ct);
+
+            return new BaselineArtifacts() {
+                BaselineSolution = Solution,
+                BaselineProjectId = ProjectId,
+                BaselineOutputAsmPath = outputAsm,
+                DocResolver = new DocResolver (project),
+                HotReloadService = HotReloadService,
+                Workspace = Workspace
+            };
+        }
+        catch (Exception preparationFailure) {
+            if (sessionStarted) {
+                try {
+                    HotReloadService.EndSession();
+                }
+                catch (Exception cleanupFailure) {
+                    throw new AggregateException(
+                        "Baseline preparation failed and the Hot Reload session could not be ended.",
+                        preparationFailure,
+                        cleanupFailure);
+                }
             }
-        }, ct);
-        if (!ConsumeBaseline (project, out string? outputAsm))
-                throw new Exception ("could not consume baseline");
-        var artifacts = new BaselineArtifacts() {
-            BaselineSolution = Solution,
-            BaselineProjectId = ProjectId,
-            BaselineOutputAsmPath = outputAsm,
-            DocResolver = new DocResolver (project),
-            HotReloadService = HotReloadService
-        };
-        await t;
-        return artifacts;
 
+            throw;
+        }
     }
 
     static bool ConsumeBaseline (Project project, [NotNullWhen(true)] out string? outputAsm)
