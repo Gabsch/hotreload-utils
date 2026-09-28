@@ -332,7 +332,9 @@ public sealed class HotReloadDeltaSession : IDisposable
             return RestartRequired(normalizedChanges, runtimeDocumentChanges.Error!);
         }
 
-        var runtimeChangedFiles = runtimeDocumentChanges.Files.ToHashSet(PathComparer);
+        var runtimeChangedFiles = runtimeDocumentChanges.Files
+            .Concat(runtimeDocumentChanges.GeneratedFiles)
+            .ToHashSet(PathComparer);
 
         var updates = await hotReloadService.GetUpdatesAsync(
             updatedSolution,
@@ -668,9 +670,49 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
         }
 
+        var generatedFiles = ImmutableArray.CreateBuilder<string>();
+        var committedGeneratedDocuments = await pdbProject.GetSourceGeneratedDocumentsAsync(cancellationToken);
+        var updatedGeneratedDocuments = await updatedProject.GetSourceGeneratedDocumentsAsync(cancellationToken);
+        var committedGeneratedById = committedGeneratedDocuments.ToDictionary(static document => document.Id);
+        var updatedGeneratedById = updatedGeneratedDocuments.ToDictionary(static document => document.Id);
+        foreach (var committedDocument in committedGeneratedDocuments)
+        {
+            if (!updatedGeneratedById.ContainsKey(committedDocument.Id))
+            {
+                return RuntimeDocumentChangeAnalysisResult.Fail(
+                    $"Source-generated document '{committedDocument.Name}' was removed and cannot be correlated exactly; restart/replay is required.");
+            }
+        }
+
+        foreach (var updatedDocument in updatedGeneratedDocuments)
+        {
+            if (!committedGeneratedById.TryGetValue(updatedDocument.Id, out var committedDocument))
+            {
+                return RuntimeDocumentChangeAnalysisResult.Fail(
+                    $"Source-generated document '{updatedDocument.Name}' was added and cannot be correlated exactly; restart/replay is required.");
+            }
+
+            var committedText = await committedDocument.GetTextAsync(cancellationToken);
+            var updatedText = await updatedDocument.GetTextAsync(cancellationToken);
+            if (committedText.ContentEquals(updatedText))
+            {
+                continue;
+            }
+
+            var generatedPath = TryGetFullPath(updatedDocument.FilePath ?? string.Empty);
+            if (generatedPath is null)
+            {
+                return RuntimeDocumentChangeAnalysisResult.Fail(
+                    $"Changed source-generated document '{updatedDocument.Name}' does not have a stable physical or PDB path; restart/replay is required.");
+            }
+
+            generatedFiles.Add(generatedPath);
+        }
+
         return RuntimeDocumentChangeAnalysisResult.Ok(
             changedFiles.ToImmutable(),
-            additionalFiles.ToImmutable());
+            additionalFiles.ToImmutable(),
+            generatedFiles.ToImmutable());
     }
 
     private static PortablePdbCapture CapturePortablePdb(string assemblyPath, ImmutableArray<byte> peImage)
@@ -917,14 +959,22 @@ public sealed class HotReloadDeltaSession : IDisposable
         var changedPaths = changedFiles
             .Select(Path.GetFullPath)
             .ToHashSet(PathComparer);
-        var committedChecksums = await ReadAdditionalDocumentChecksumsAsync(
+        var committedDocuments = await ReadAdditionalDocumentSnapshotsAsync(
             committedProject,
             changedPaths,
             cancellationToken);
-        var updatedChecksums = await ReadAdditionalDocumentChecksumsAsync(
+        var updatedDocuments = await ReadAdditionalDocumentSnapshotsAsync(
             updatedProject,
             changedPaths,
             cancellationToken);
+        var committedChecksums = committedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var updatedChecksums = updatedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
         var oldPdb = ReadPortablePdbData(baselinePdb);
         var newPdb = ReadPortablePdbData(updatedPdb);
         var resolvedOldDocuments = ResolveChangedDocumentPaths(
@@ -954,34 +1004,40 @@ public sealed class HotReloadDeltaSession : IDisposable
             updatedChecksums);
         foreach (var path in changedPaths)
         {
-            var oldLines = resolvedOldPoints
+            var oldPoints = resolvedOldPoints
                 .Where(point => !point.Hidden && PathComparer.Equals(point.FilePath, path))
-                .Select(static point => point.StartLine)
-                .Distinct()
-                .Order()
+                .OrderBy(static point => point.MethodToken)
+                .ThenBy(static point => point.IlOffset)
                 .ToArray();
-            var newLines = resolvedNewPoints
+            var newPoints = resolvedNewPoints
                 .Where(point => !point.Hidden && PathComparer.Equals(point.FilePath, path))
-                .Select(static point => point.StartLine)
-                .Distinct()
-                .Order()
+                .OrderBy(static point => point.MethodToken)
+                .ThenBy(static point => point.IlOffset)
                 .ToArray();
-            if (!oldLines.SequenceEqual(newLines))
+            string? identityError = null;
+            if (!committedDocuments.TryGetValue(path, out var committedDocument) ||
+                !updatedDocuments.TryGetValue(path, out var updatedDocument) ||
+                !HasExactAdditionalDocumentPointIdentity(
+                    oldPoints,
+                    newPoints,
+                    committedDocument.Text,
+                    updatedDocument.Text,
+                    out identityError))
             {
                 return AdditionalDocumentValidationResult.Fail(
-                    $"Visible sequence-point positions changed ambiguously in generated or additional document '{path}' and cannot be correlated exactly; restart/replay is required.");
+                    $"Visible sequence-point positions or identities changed ambiguously in generated or additional document '{path}' and cannot be correlated exactly ({identityError ?? "document evidence was unavailable"}); restart/replay is required.");
             }
         }
 
         return AdditionalDocumentValidationResult.Ok();
     }
 
-    private static async Task<Dictionary<string, ImmutableArray<byte>>> ReadAdditionalDocumentChecksumsAsync(
+    private static async Task<Dictionary<string, AdditionalDocumentSnapshot>> ReadAdditionalDocumentSnapshotsAsync(
         Project project,
         IReadOnlySet<string> changedPaths,
         CancellationToken cancellationToken)
     {
-        var result = new Dictionary<string, ImmutableArray<byte>>(PathComparer);
+        var result = new Dictionary<string, AdditionalDocumentSnapshot>(PathComparer);
         foreach (var document in project.AdditionalDocuments)
         {
             if (document.FilePath is null)
@@ -996,10 +1052,95 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             var text = await document.GetTextAsync(cancellationToken);
-            result.Add(path, text.GetChecksum());
+            result.Add(path, new(path, text, text.GetChecksum()));
         }
 
         return result;
+    }
+
+    private static bool HasExactAdditionalDocumentPointIdentity(
+        IReadOnlyList<PortableSequencePoint> oldPoints,
+        IReadOnlyList<PortableSequencePoint> newPoints,
+        SourceText oldText,
+        SourceText newText,
+        out string? error)
+    {
+        if (oldPoints.Count != newPoints.Count)
+        {
+            error = $"visible point count changed from {oldPoints.Count} to {newPoints.Count}";
+            return false;
+        }
+
+        var oldAnchors = oldPoints.Select(point => CreateSourcePointAnchor(point, oldText)).ToArray();
+        var newAnchors = newPoints.Select(point => CreateSourcePointAnchor(point, newText)).ToArray();
+        for (var index = 0; index < oldPoints.Count; index++)
+        {
+            var oldPoint = oldPoints[index];
+            var newPoint = newPoints[index];
+            if (oldPoint.MethodToken != newPoint.MethodToken ||
+                oldPoint.StartLine != newPoint.StartLine ||
+                oldPoint.EndLine != newPoint.EndLine)
+            {
+                error = $"point {index} changed method or source line span";
+                return false;
+            }
+
+            var oldAnchor = oldAnchors[index];
+            if (oldAnchor is not null)
+            {
+                var movedMatches = newAnchors
+                    .Select((anchor, candidateIndex) => (anchor, candidateIndex))
+                    .Where(candidate => string.Equals(candidate.anchor, oldAnchor, StringComparison.Ordinal))
+                    .Select(static candidate => candidate.candidateIndex)
+                    .ToArray();
+                if (movedMatches.Length == 1 && movedMatches[0] != index)
+                {
+                    error = $"point {index} retained its source identity at new point {movedMatches[0]}";
+                    return false;
+                }
+            }
+
+            var newAnchor = newAnchors[index];
+            if (newAnchor is not null)
+            {
+                var movedMatches = oldAnchors
+                    .Select((anchor, candidateIndex) => (anchor, candidateIndex))
+                    .Where(candidate => string.Equals(candidate.anchor, newAnchor, StringComparison.Ordinal))
+                    .Select(static candidate => candidate.candidateIndex)
+                    .ToArray();
+                if (movedMatches.Length == 1 && movedMatches[0] != index)
+                {
+                    error = $"new point {index} retained its source identity at old point {movedMatches[0]}";
+                    return false;
+                }
+            }
+        }
+
+        error = null;
+        return true;
+    }
+
+    private static string? CreateSourcePointAnchor(PortableSequencePoint point, SourceText text)
+    {
+        if (point.StartLine < 0 ||
+            point.StartLine >= text.Lines.Count ||
+            point.EndLine < point.StartLine ||
+            point.EndLine >= text.Lines.Count)
+        {
+            return null;
+        }
+
+        var startLine = text.Lines[point.StartLine];
+        var endLine = text.Lines[point.EndLine];
+        var start = Math.Clamp(startLine.Start + Math.Max(point.StartColumn - 1, 0), startLine.Start, startLine.End);
+        var end = Math.Clamp(endLine.Start + Math.Max(point.EndColumn - 1, 0), endLine.Start, endLine.End);
+        if (end <= start)
+        {
+            return null;
+        }
+
+        return string.Concat(text.ToString(TextSpan.FromBounds(start, end))
+            .Where(static character => !char.IsWhiteSpace(character)));
     }
 
     private static ImmutableArray<string> FindMissingPaths(
@@ -1129,7 +1270,8 @@ public sealed class HotReloadDeltaSession : IDisposable
         CancellationToken cancellationToken)
     {
         var result = new Dictionary<string, DocumentSyntaxSnapshot>(PathComparer);
-        foreach (var document in project.Documents)
+        var sourceGeneratedDocuments = await project.GetSourceGeneratedDocumentsAsync(cancellationToken);
+        foreach (var document in project.Documents.Concat<Microsoft.CodeAnalysis.Document>(sourceGeneratedDocuments))
         {
             if (document.FilePath is null)
             {
@@ -1606,6 +1748,11 @@ public sealed class HotReloadDeltaSession : IDisposable
         SourceText Text,
         ImmutableArray<byte> Checksum);
 
+    private sealed record AdditionalDocumentSnapshot(
+        string FilePath,
+        SourceText Text,
+        ImmutableArray<byte> Checksum);
+
     private sealed record SyntaxAnchor(string Kind, string Text);
 
     private sealed record SequencePointPair(PortableSequencePoint Old, PortableSequencePoint New);
@@ -1641,15 +1788,17 @@ public sealed class HotReloadDeltaSession : IDisposable
         bool Success,
         ImmutableArray<string> Files,
         ImmutableArray<string> AdditionalFiles,
+        ImmutableArray<string> GeneratedFiles,
         string? Error)
     {
         public static RuntimeDocumentChangeAnalysisResult Ok(
             ImmutableArray<string> files,
-            ImmutableArray<string> additionalFiles) =>
-            new(true, files, additionalFiles, null);
+            ImmutableArray<string> additionalFiles,
+            ImmutableArray<string> generatedFiles) =>
+            new(true, files, additionalFiles, generatedFiles, null);
 
         public static RuntimeDocumentChangeAnalysisResult Fail(string error) =>
-            new(false, [], [], error);
+            new(false, [], [], [], error);
     }
 
     private sealed record AdditionalDocumentValidationResult(bool Success, string? Error)
