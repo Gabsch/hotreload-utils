@@ -1101,8 +1101,11 @@ public sealed class HotReloadDeltaSession : IDisposable
             return false;
         }
 
-        var oldAnchors = oldPoints.Select(point => CreateSourcePointIdentityAnchor(point, oldText)).ToArray();
-        var newAnchors = newPoints.Select(point => CreateSourcePointIdentityAnchor(point, newText)).ToArray();
+        var oldExactAnchors = oldPoints.Select(point => CreateSourcePointAnchor(point, oldText)).ToArray();
+        var newExactAnchors = newPoints.Select(point => CreateSourcePointAnchor(point, newText)).ToArray();
+        var oldIdentityAnchors = oldPoints.Select(point => CreateSourcePointIdentityAnchor(point, oldText)).ToArray();
+        var newIdentityAnchors = newPoints.Select(point => CreateSourcePointIdentityAnchor(point, newText)).ToArray();
+        var structurallyMatchedIndexes = new List<int>();
         for (var index = 0; index < oldPoints.Count; index++)
         {
             var oldPoint = oldPoints[index];
@@ -1115,17 +1118,38 @@ public sealed class HotReloadDeltaSession : IDisposable
                 return false;
             }
 
-            var oldAnchor = oldAnchors[index];
-            var newAnchor = newAnchors[index];
-            if (oldAnchor is null || newAnchor is null)
+            var oldExactAnchor = oldExactAnchors[index];
+            var newExactAnchor = newExactAnchors[index];
+            var oldIdentityAnchor = oldIdentityAnchors[index];
+            var newIdentityAnchor = newIdentityAnchors[index];
+            if (oldExactAnchor is null ||
+                newExactAnchor is null ||
+                oldIdentityAnchor is null ||
+                newIdentityAnchor is null)
             {
                 error = $"point {index} lacks complete source identity evidence";
                 return false;
             }
 
-            if (!string.Equals(oldAnchor, newAnchor, StringComparison.Ordinal))
+            if (string.Equals(oldExactAnchor, newExactAnchor, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            if (!string.Equals(oldIdentityAnchor, newIdentityAnchor, StringComparison.Ordinal))
             {
                 error = $"point {index} does not retain a one-to-one source identity";
+                return false;
+            }
+
+            structurallyMatchedIndexes.Add(index);
+        }
+
+        foreach (var group in structurallyMatchedIndexes.GroupBy(index => oldIdentityAnchors[index], StringComparer.Ordinal))
+        {
+            if (group.Count() > 1)
+            {
+                error = $"points {string.Join(", ", group)} share a non-unique changed source identity";
                 return false;
             }
         }
@@ -1135,6 +1159,31 @@ public sealed class HotReloadDeltaSession : IDisposable
     }
 
     private static string? CreateSourcePointIdentityAnchor(PortableSequencePoint point, SourceText text)
+    {
+        var source = ReadSourcePointText(point, text);
+        if (source is null)
+        {
+            return null;
+        }
+
+        var tokens = SyntaxFactory.ParseTokens(source)
+            .Where(static token => !token.IsKind(SyntaxKind.EndOfFileToken))
+            .Select(static token => token.IsKind(SyntaxKind.IdentifierToken)
+                ? $"identifier:{token.ValueText}"
+                : token.Kind().ToString())
+            .ToArray();
+        return tokens.Length == 0 ? null : string.Join('|', tokens);
+    }
+
+    private static string? CreateSourcePointAnchor(PortableSequencePoint point, SourceText text)
+    {
+        var source = ReadSourcePointText(point, text);
+        return source is null
+            ? null
+            : string.Concat(source.Where(static character => !char.IsWhiteSpace(character)));
+    }
+
+    private static string? ReadSourcePointText(PortableSequencePoint point, SourceText text)
     {
         if (point.StartLine < 0 ||
             point.StartLine >= text.Lines.Count ||
@@ -1153,14 +1202,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             return null;
         }
 
-        var source = text.ToString(TextSpan.FromBounds(start, end));
-        var tokens = SyntaxFactory.ParseTokens(source)
-            .Where(static token => !token.IsKind(SyntaxKind.EndOfFileToken))
-            .Select(static token => token.IsKind(SyntaxKind.IdentifierToken)
-                ? $"identifier:{token.ValueText}"
-                : token.Kind().ToString())
-            .ToArray();
-        return tokens.Length == 0 ? null : string.Join('|', tokens);
+        return text.ToString(TextSpan.FromBounds(start, end));
     }
 
     private static ImmutableArray<string> FindMissingPaths(

@@ -174,6 +174,33 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsRazorPermutationWithDuplicateStructuralAnchors()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await RazorProjectFixture.CreateAsync(
+            cancellationToken,
+            RazorProjectFixture.DuplicateStructuralAnchorsBaseline);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, RazorProjectFixture.DuplicateStructuralAnchorsSwapped)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Empty(update.MetadataDelta);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning =>
+            warning.Contains("non-unique", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task Session_PreservesSameLineRazorSequencePointMultiplicity()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -2047,6 +2074,24 @@ public sealed class HotReloadDeltaSessionTests
             @code {
                 private int A(int value) => value;
                 private int B(int value) => value;
+            }
+            """;
+
+        public const string DuplicateStructuralAnchorsBaseline = """
+            @namespace RazorDeltaFixture
+            <p>@A(1)</p>
+            <p>@A(2)</p>
+            @code {
+                private int A(int value) => value;
+            }
+            """;
+
+        public const string DuplicateStructuralAnchorsSwapped = """
+            @namespace RazorDeltaFixture
+            <p>@A(2)</p>
+            <p>@A(1)</p>
+            @code {
+                private int A(int value) => value;
             }
             """;
 
