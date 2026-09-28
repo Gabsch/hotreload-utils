@@ -438,12 +438,19 @@ public sealed class HotReloadDeltaSession : IDisposable
                 return RestartRequired(normalizedChanges, tokenValidation);
             }
 
-            runtimeChangedFiles.UnionWith(await FindGeneratedFilesWithVisiblePdbPointsAsync(
+            var generatedPdbEvidence = await FindGeneratedFilesWithVisiblePdbPointsAsync(
                 pdbSolution.GetProject(projectId)!,
                 updatedSolution.GetProject(projectId)!,
                 fullPdb.Pdb,
                 runtimeDocumentChanges.GeneratedFiles,
-                cancellationToken));
+                cancellationToken);
+            if (!generatedPdbEvidence.Success)
+            {
+                hotReloadService.DiscardUpdate();
+                return RestartRequired(normalizedChanges, generatedPdbEvidence.Error!);
+            }
+
+            runtimeChangedFiles.UnionWith(generatedPdbEvidence.Files);
 
             ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
             var includesUpdatedMethodMappings = false;
@@ -622,22 +629,20 @@ public sealed class HotReloadDeltaSession : IDisposable
             isRudeEdit);
     }
 
-    private static bool ContainsLineDirective(SourceText text) =>
-        CSharpSyntaxTree.ParseText(text)
-            .GetRoot()
+    private static bool ContainsLineDirective(SyntaxNode root) =>
+        root
             .DescendantTrivia(descendIntoTrivia: true)
             .Any(static trivia =>
                 trivia.IsKind(SyntaxKind.LineDirectiveTrivia) ||
                 trivia.IsKind(SyntaxKind.LineSpanDirectiveTrivia));
 
     private static bool ContainsUnaccountedLineDirective(
-        SourceText text,
+        SyntaxNode root,
         IEnumerable<string> changedAdditionalFiles,
         string? projectDirectory)
     {
         var accountedPaths = changedAdditionalFiles.ToHashSet(PathComparer);
-        return CSharpSyntaxTree.ParseText(text)
-            .GetRoot()
+        return root
             .DescendantTrivia(descendIntoTrivia: true)
             .Where(static trivia =>
                 trivia.IsKind(SyntaxKind.LineDirectiveTrivia) ||
@@ -684,7 +689,12 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
-            if (ContainsLineDirective(pdbText) || ContainsLineDirective(updatedText))
+            var pdbRoot = await pdbDocument.GetSyntaxRootAsync(cancellationToken);
+            var updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken);
+            if (pdbRoot is null ||
+                updatedRoot is null ||
+                ContainsLineDirective(pdbRoot) ||
+                ContainsLineDirective(updatedRoot))
             {
                 return RuntimeDocumentChangeAnalysisResult.Fail(
                     "Line-moving and #line-mapped edits require restart/replay until exact Roslyn sequence-point updates are exposed.");
@@ -739,9 +749,13 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
+            var committedRoot = await committedDocument.GetSyntaxRootAsync(cancellationToken);
+            var updatedRoot = await updatedDocument.GetSyntaxRootAsync(cancellationToken);
             var projectDirectory = Path.GetDirectoryName(updatedProject.FilePath ?? pdbProject.FilePath);
-            if (ContainsUnaccountedLineDirective(committedText, additionalFiles, projectDirectory) ||
-                ContainsUnaccountedLineDirective(updatedText, additionalFiles, projectDirectory))
+            if (committedRoot is null ||
+                updatedRoot is null ||
+                ContainsUnaccountedLineDirective(committedRoot, additionalFiles, projectDirectory) ||
+                ContainsUnaccountedLineDirective(updatedRoot, additionalFiles, projectDirectory))
             {
                 return RuntimeDocumentChangeAnalysisResult.Fail(
                     $"Changed source-generated document '{updatedDocument.Name}' contains #line mappings that are not owned by a changed additional document and cannot be correlated exactly; restart/replay is required.");
@@ -872,7 +886,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             pdbStream.ToArray().ToImmutableArray());
     }
 
-    private async Task<ImmutableArray<string>> FindGeneratedFilesWithVisiblePdbPointsAsync(
+    private async Task<GeneratedPdbEvidenceResult> FindGeneratedFilesWithVisiblePdbPointsAsync(
         Project committedProject,
         Project updatedProject,
         ImmutableArray<byte> updatedPdb,
@@ -881,7 +895,7 @@ public sealed class HotReloadDeltaSession : IDisposable
     {
         if (generatedFiles.IsEmpty)
         {
-            return [];
+            return GeneratedPdbEvidenceResult.Ok([]);
         }
 
         var generatedPaths = generatedFiles
@@ -905,22 +919,88 @@ public sealed class HotReloadDeltaSession : IDisposable
             PathComparer);
         var oldPdb = ReadPortablePdbData(baselinePdb);
         var newPdb = ReadPortablePdbData(updatedPdb);
+        var projectDirectory = Path.GetDirectoryName(updatedProject.FilePath ?? committedProject.FilePath);
+        var ambiguity = FindAmbiguousGeneratedPdbEvidence(
+                oldPdb.Documents.Select(static document => (document.FilePath, document.Checksum)),
+                generatedPaths,
+                committedChecksums,
+                projectDirectory)
+            ?? FindAmbiguousGeneratedPdbEvidence(
+                newPdb.Documents.Select(static document => (document.FilePath, document.Checksum)),
+                generatedPaths,
+                updatedChecksums,
+                projectDirectory);
+        if (ambiguity is not null)
+        {
+            return GeneratedPdbEvidenceResult.Fail(ambiguity);
+        }
+
         var visiblePaths = ResolveChangedDocumentPoints(
                 oldPdb.SequencePoints,
                 generatedPaths,
-                committedChecksums)
+                committedChecksums,
+                projectDirectory)
             .Concat(ResolveChangedDocumentPoints(
                 newPdb.SequencePoints,
                 generatedPaths,
-                updatedChecksums))
+                updatedChecksums,
+                projectDirectory))
             .Where(static point => !point.Hidden)
             .Select(static point => point.FilePath)
             .ToHashSet(PathComparer);
 
-        return generatedFiles
+        return GeneratedPdbEvidenceResult.Ok(generatedFiles
             .Where(visiblePaths.Contains)
             .Distinct(PathComparer)
-            .ToImmutableArray();
+            .ToImmutableArray());
+    }
+
+    private static string? FindAmbiguousGeneratedPdbEvidence(
+        IEnumerable<(string FilePath, ImmutableArray<byte> Checksum)> documents,
+        IReadOnlySet<string> generatedPaths,
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums,
+        string? projectDirectory)
+    {
+        foreach (var document in documents)
+        {
+            if (ResolveChangedDocumentPath(
+                    document.FilePath,
+                    document.Checksum,
+                    generatedPaths,
+                    documentChecksums,
+                    projectDirectory) is not null)
+            {
+                continue;
+            }
+
+            var pathMapMatches = FindProjectRelativePathMatches(
+                document.FilePath,
+                generatedPaths,
+                projectDirectory);
+            if (pathMapMatches.Length > 1)
+            {
+                return $"Generated portable-PDB path '{document.FilePath}' matches multiple changed source-generated documents and cannot be correlated exactly; restart/replay is required.";
+            }
+
+            if (document.Checksum.IsDefaultOrEmpty)
+            {
+                continue;
+            }
+
+            var checksumMatches = documentChecksums
+                .Where(pair =>
+                    generatedPaths.Contains(pair.Key) &&
+                    document.Checksum.AsSpan().SequenceEqual(pair.Value.AsSpan()))
+                .Select(static pair => pair.Key)
+                .Distinct(PathComparer)
+                .ToArray();
+            if (checksumMatches.Length > 1)
+            {
+                return $"Generated portable-PDB evidence for '{document.FilePath}' matches multiple changed source-generated documents and cannot be correlated exactly; restart/replay is required.";
+            }
+        }
+
+        return null;
     }
 
     private async Task<ExactLineUpdateResult> CreateExactLineUpdatesAsync(
@@ -1295,7 +1375,8 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static ImmutableArray<PortableSequencePoint> ResolveChangedDocumentPoints(
         ImmutableArray<PortableSequencePoint> points,
         HashSet<string> changedPaths,
-        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums)
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums,
+        string? projectDirectory = null)
     {
         var result = ImmutableArray.CreateBuilder<PortableSequencePoint>();
         foreach (var point in points)
@@ -1304,7 +1385,8 @@ public sealed class HotReloadDeltaSession : IDisposable
                 point.FilePath,
                 point.DocumentChecksum,
                 changedPaths,
-                documentChecksums);
+                documentChecksums,
+                projectDirectory);
             if (resolvedPath is not null)
             {
                 result.Add(point with { FilePath = resolvedPath });
@@ -1333,13 +1415,23 @@ public sealed class HotReloadDeltaSession : IDisposable
         string pdbDocumentPath,
         ImmutableArray<byte> pdbDocumentChecksum,
         IReadOnlySet<string> changedPaths,
-        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums)
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums,
+        string? projectDirectory = null)
     {
         var fullPath = TryGetFullPath(pdbDocumentPath);
         var directMatches = changedPaths.Where(path => PathComparer.Equals(path, fullPath)).ToArray();
         if (directMatches.Length == 1)
         {
             return directMatches[0];
+        }
+
+        var pathMapMatches = FindProjectRelativePathMatches(
+            pdbDocumentPath,
+            changedPaths,
+            projectDirectory);
+        if (pathMapMatches.Length == 1)
+        {
+            return pathMapMatches[0];
         }
 
         if (pdbDocumentChecksum.IsDefaultOrEmpty)
@@ -1355,6 +1447,37 @@ public sealed class HotReloadDeltaSession : IDisposable
             .Distinct(PathComparer)
             .ToArray();
         return checksumMatches.Length == 1 ? checksumMatches[0] : null;
+    }
+
+    private static string[] FindProjectRelativePathMatches(
+        string pdbDocumentPath,
+        IReadOnlySet<string> changedPaths,
+        string? projectDirectory)
+    {
+        if (string.IsNullOrWhiteSpace(projectDirectory))
+        {
+            return [];
+        }
+
+        var normalizedPdbPath = pdbDocumentPath.Replace('\\', '/');
+        return changedPaths
+            .Where(path =>
+            {
+                var relativePath = Path.GetRelativePath(projectDirectory, path);
+                if (Path.IsPathRooted(relativePath) ||
+                    relativePath.Equals("..", PathComparison) ||
+                    relativePath.StartsWith($"..{Path.DirectorySeparatorChar}", PathComparison) ||
+                    relativePath.StartsWith($"..{Path.AltDirectorySeparatorChar}", PathComparison))
+                {
+                    return false;
+                }
+
+                var normalizedRelativePath = relativePath.Replace('\\', '/');
+                return normalizedPdbPath.Equals(normalizedRelativePath, PathComparison) ||
+                    normalizedPdbPath.EndsWith($"/{normalizedRelativePath}", PathComparison);
+            })
+            .Distinct(PathComparer)
+            .ToArray();
     }
 
     private static string? TryGetFullPath(string path, string? baseDirectory = null)
@@ -1923,6 +2046,18 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         public static ExactLineUpdateResult Fail(string error) =>
             new(false, [], false, error);
+    }
+
+    private sealed record GeneratedPdbEvidenceResult(
+        bool Success,
+        ImmutableArray<string> Files,
+        string? Error)
+    {
+        public static GeneratedPdbEvidenceResult Ok(ImmutableArray<string> files) =>
+            new(true, files, null);
+
+        public static GeneratedPdbEvidenceResult Fail(string error) =>
+            new(false, [], error);
     }
 
     private sealed record RuntimeDocumentChangeAnalysisResult(

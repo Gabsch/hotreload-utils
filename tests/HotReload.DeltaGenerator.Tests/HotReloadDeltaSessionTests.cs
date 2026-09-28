@@ -426,6 +426,41 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_UsesProjectPreprocessorSymbolsForGeneratedLineMappings()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var inputDocument = baselineProject.Documents.Single(document =>
+            string.Equals(document.FilePath, fixture.SourcePath, StringComparison.OrdinalIgnoreCase));
+        var updatedSolution = baselineSolution.WithDocumentText(
+            inputDocument.Id,
+            SourceText.From(SourceGeneratorProjectFixture.InputSource(
+                generatedLines: 0,
+                value: 1,
+                generatedConditionalDirective: 1)));
+
+        var analysis = await AnalyzeRuntimeDocumentChangesAsync(
+            baselineProject,
+            updatedSolution.GetProject(baselineProject.Id)!,
+            cancellationToken);
+
+        Assert.False((bool)analysis.GetType().GetProperty("Success")!.GetValue(analysis)!);
+        var error = (string?)analysis.GetType().GetProperty("Error")!.GetValue(analysis);
+        Assert.Contains("#line", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Session_DoesNotRequireGeneratedPdbEntryWhenVisiblePointsAreFullyLineMapped()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -453,7 +488,7 @@ public sealed class HotReloadDeltaSessionTests
             .GetField("baselinePdb", BindingFlags.NonPublic | BindingFlags.Instance)!
             .GetValue(session)!;
 
-        var filesWithIndependentPoints = await FindGeneratedFilesWithVisiblePdbPointsAsync(
+        var evidence = await FindGeneratedFilesWithVisiblePdbPointsAsync(
             session,
             baselineProject,
             baselineProject,
@@ -461,7 +496,83 @@ public sealed class HotReloadDeltaSessionTests
             [Path.GetFullPath(generatedDocument.FilePath!)],
             cancellationToken);
 
+        Assert.True((bool)evidence.GetType().GetProperty("Success")!.GetValue(evidence)!);
+        var filesWithIndependentPoints = (ImmutableArray<string>)evidence.GetType()
+            .GetProperty("Files")!
+            .GetValue(evidence)!;
         Assert.Empty(filesWithIndependentPoints);
+    }
+
+    [Fact]
+    public async Task Session_CorrelatesIdenticalGeneratedPdbEvidenceThroughPathMap()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(
+            cancellationToken,
+            SourceGeneratorProjectFixture.InputSource(
+                generatedLines: 0,
+                value: 1,
+                duplicateGeneratedDocuments: 1),
+            usePathMap: true);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var generatedPaths = (await baselineProject.GetSourceGeneratedDocumentsAsync(cancellationToken))
+            .Where(document => document.Name.StartsWith("GeneratedCalculator", StringComparison.Ordinal))
+            .Select(document => Path.GetFullPath(document.FilePath!))
+            .ToImmutableArray();
+        Assert.Equal(2, generatedPaths.Length);
+        var baselinePdb = (ImmutableArray<byte>)typeof(HotReloadDeltaSession)
+            .GetField("baselinePdb", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(session)!;
+
+        var evidence = await FindGeneratedFilesWithVisiblePdbPointsAsync(
+            session,
+            baselineProject,
+            baselineProject,
+            baselinePdb,
+            generatedPaths,
+            cancellationToken);
+
+        Assert.True((bool)evidence.GetType().GetProperty("Success")!.GetValue(evidence)!);
+        var resolvedFiles = (ImmutableArray<string>)evidence.GetType()
+            .GetProperty("Files")!
+            .GetValue(evidence)!;
+        var pathComparer = OperatingSystem.IsWindows()
+            ? StringComparer.OrdinalIgnoreCase
+            : StringComparer.Ordinal;
+        Assert.Equal(generatedPaths.Order(pathComparer), resolvedFiles.Order(pathComparer));
+    }
+
+    [Fact]
+    public void Session_RejectsUnresolvedAmbiguousGeneratedPdbChecksumEvidence()
+    {
+        var checksum = ImmutableArray.Create<byte>(1, 2, 3, 4);
+        var generatedPaths = new HashSet<string>(StringComparer.Ordinal)
+        {
+            "/workspace/GeneratorA/Shared.g.cs",
+            "/workspace/GeneratorB/Shared.g.cs"
+        };
+        var checksums = generatedPaths.ToDictionary(
+            static path => path,
+            _ => checksum,
+            StringComparer.Ordinal);
+        var documents = new[] { (FilePath: "/mapped/Shared.g.cs", Checksum: checksum) };
+        var find = typeof(HotReloadDeltaSession).GetMethod(
+            "FindAmbiguousGeneratedPdbEvidence",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+
+        var error = (string?)find.Invoke(null, [documents, generatedPaths, checksums, null]);
+
+        Assert.Contains("multiple", error, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1378,7 +1489,8 @@ public sealed class HotReloadDeltaSessionTests
             new Dictionary<string, ImmutableArray<byte>>(StringComparer.OrdinalIgnoreCase)
             {
                 [fixture.SourcePath] = checksum
-            }
+            },
+            null
         ]);
 
         Assert.Equal(fixture.SourcePath, resolvedPath);
@@ -2145,7 +2257,7 @@ public sealed class HotReloadDeltaSessionTests
         return analysisTask.GetType().GetProperty("Result")!.GetValue(analysisTask)!;
     }
 
-    private static async Task<ImmutableArray<string>> FindGeneratedFilesWithVisiblePdbPointsAsync(
+    private static async Task<object> FindGeneratedFilesWithVisiblePdbPointsAsync(
         HotReloadDeltaSession session,
         Microsoft.CodeAnalysis.Project baselineProject,
         Microsoft.CodeAnalysis.Project updatedProject,
@@ -2164,7 +2276,7 @@ public sealed class HotReloadDeltaSessionTests
             cancellationToken
         ])!;
         await findTask;
-        return (ImmutableArray<string>)findTask.GetType().GetProperty("Result")!.GetValue(findTask)!;
+        return findTask.GetType().GetProperty("Result")!.GetValue(findTask)!;
     }
 
     private sealed class RazorProjectFixture : IDisposable
@@ -2391,7 +2503,9 @@ public sealed class HotReloadDeltaSessionTests
             int generatedLines,
             int value,
             int generatedLineDirective = 0,
-            int generatedLineSpanDirective = 0) => $$"""
+            int generatedLineSpanDirective = 0,
+            int generatedConditionalDirective = 0,
+            int duplicateGeneratedDocuments = 0) => $$"""
             namespace GeneratedDeltaFixture;
 
             public static class GeneratorInput
@@ -2399,6 +2513,8 @@ public sealed class HotReloadDeltaSessionTests
                 public const int GeneratedLines = {{generatedLines}};
                 public const int GeneratedLineDirective = {{generatedLineDirective}};
                 public const int GeneratedLineSpanDirective = {{generatedLineSpanDirective}};
+                public const int GeneratedConditionalDirective = {{generatedConditionalDirective}};
+                public const int DuplicateGeneratedDocuments = {{duplicateGeneratedDocuments}};
                 public static int Value() => {{value}};
             }
             """;
@@ -2406,7 +2522,8 @@ public sealed class HotReloadDeltaSessionTests
         public static async Task<SourceGeneratorProjectFixture> CreateAsync(
             CancellationToken cancellationToken,
             string? initialSource = null,
-            string initialAdditionalSource = "baseline")
+            string initialAdditionalSource = "baseline",
+            bool usePathMap = false)
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-source-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -2469,33 +2586,66 @@ public sealed class HotReloadDeltaSessionTests
                             .OfType<LiteralExpressionSyntax>()
                             .Select(static literal => (int)literal.Token.Value!)
                             .Single();
+                        var generatedConditionalDirective = context.Compilation.SyntaxTrees
+                            .SelectMany(static tree => tree.GetRoot().DescendantNodes().OfType<VariableDeclaratorSyntax>())
+                            .Where(static variable => variable.Identifier.ValueText == "GeneratedConditionalDirective")
+                            .Select(static variable => variable.Initializer?.Value)
+                            .OfType<LiteralExpressionSyntax>()
+                            .Select(static literal => (int)literal.Token.Value!)
+                            .Single();
+                        var duplicateGeneratedDocuments = context.Compilation.SyntaxTrees
+                            .SelectMany(static tree => tree.GetRoot().DescendantNodes().OfType<VariableDeclaratorSyntax>())
+                            .Where(static variable => variable.Identifier.ValueText == "DuplicateGeneratedDocuments")
+                            .Select(static variable => variable.Initializer?.Value)
+                            .OfType<LiteralExpressionSyntax>()
+                            .Select(static literal => (int)literal.Token.Value!)
+                            .Single();
                         var padding = string.Concat(Enumerable.Repeat("        // generated padding\n", generatedLines));
-                        var lineDirective = generatedLineSpanDirective != 0
-                            ? "#line (1,1)-(1,10) \"untracked.cs\"\n"
-                            : generatedLineDirective == 0
-                                ? string.Empty
-                                : $"#line {generatedLineDirective} \"input.cs\"\n";
-                        var source = $$"""
-                            namespace GeneratedDeltaFixture;
+                        var lineDirective = generatedConditionalDirective != 0
+                            ? "#if DEBUG\n#line 1 \"untracked.cs\"\n#endif\n"
+                            : generatedLineSpanDirective != 0
+                                ? "#line (1,1)-(1,10) \"untracked.cs\"\n"
+                                : generatedLineDirective == 0
+                                    ? string.Empty
+                                    : $"#line {generatedLineDirective} \"input.cs\"\n";
+                        var source = duplicateGeneratedDocuments != 0
+                            ? """
+                                namespace GeneratedDeltaFixture;
 
-                            {{lineDirective}}public static class GeneratedCalculator
-                            {
-                                public static int GetValue()
+                                file static class GeneratedCalculator
                                 {
-                            {{padding}}        return 10;
+                                    public static int GetValue() => 10;
                                 }
-                            }
-                            """;
+                                """
+                            : $$"""
+                                namespace GeneratedDeltaFixture;
+
+                                {{lineDirective}}public static class GeneratedCalculator
+                                {
+                                    public static int GetValue()
+                                    {
+                                {{padding}}        return 10;
+                                    }
+                                }
+                                """;
                         context.AddSource("GeneratedCalculator.g.cs", SourceText.From(source, Encoding.UTF8));
+                        if (duplicateGeneratedDocuments != 0)
+                        {
+                            context.AddSource("GeneratedCalculatorDuplicate.g.cs", SourceText.From(source, Encoding.UTF8));
+                        }
                     }
                 }
                 """", cancellationToken);
-            await File.WriteAllTextAsync(fixture.ProjectPath, """
+            var pathMapProperty = usePathMap
+                ? "<PathMap>$(MSBuildProjectDirectory)=/_/src</PathMap>"
+                : string.Empty;
+            await File.WriteAllTextAsync(fixture.ProjectPath, $$"""
                 <Project Sdk="Microsoft.NET.Sdk">
                   <PropertyGroup>
                     <TargetFramework>net10.0</TargetFramework>
                     <DebugType>portable</DebugType>
                     <Optimize>false</Optimize>
+                    {{pathMapProperty}}
                   </PropertyGroup>
                   <ItemGroup>
                     <Compile Remove="DrivingGenerator\**\*.cs" />
