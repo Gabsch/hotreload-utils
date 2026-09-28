@@ -178,13 +178,9 @@ public sealed class HotReloadDeltaSession : IDisposable
         try
         {
             var baselinePe = (await File.ReadAllBytesAsync(outputAssembly, cancellationToken)).ToImmutableArray();
-            var pdbPath = FindPortablePdbPath(outputAssembly, baselinePe);
-            if (!File.Exists(pdbPath))
-            {
-                throw new InvalidOperationException($"Portable PDB not found for baseline assembly: {pdbPath}");
-            }
-
-            var baselinePdb = (await File.ReadAllBytesAsync(pdbPath, cancellationToken)).ToImmutableArray();
+            var baselineSymbols = CapturePortablePdb(outputAssembly, baselinePe);
+            var pdbPath = baselineSymbols.Path;
+            var baselinePdb = baselineSymbols.Image;
             var info = new HotReloadDeltaSessionInfo(
                 builder.ProjectPath,
                 configuration,
@@ -295,13 +291,6 @@ public sealed class HotReloadDeltaSession : IDisposable
             if (oldText.ContentEquals(newText))
             {
                 continue;
-            }
-
-            if (isAdditionalDocument && HasLineMovingChanges(oldText, newText))
-            {
-                return RestartRequired(
-                    normalizedChanges,
-                    "Line-moving changes in generated or additional documents are ambiguous without exact portable-PDB identity evidence.");
             }
 
             updatedSolution = isAdditionalDocument
@@ -468,6 +457,21 @@ public sealed class HotReloadDeltaSession : IDisposable
 
                 lineUpdates = mapping.LineUpdates;
                 includesUpdatedMethodMappings = mapping.IncludesUpdatedMethods;
+            }
+
+            if (!runtimeDocumentChanges.AdditionalFiles.IsEmpty)
+            {
+                var additionalValidation = await ValidateAdditionalDocumentPositionsAsync(
+                    pdbSolution.GetProject(projectId)!,
+                    updatedSolution.GetProject(projectId)!,
+                    fullPdb.Pdb,
+                    runtimeDocumentChanges.AdditionalFiles,
+                    cancellationToken);
+                if (!additionalValidation.Success)
+                {
+                    hotReloadService.DiscardUpdate();
+                    return RestartRequired(normalizedChanges, additionalValidation.Error!);
+                }
             }
 
             pendingSolution = updatedSolution;
@@ -647,236 +651,29 @@ public sealed class HotReloadDeltaSession : IDisposable
             changedFiles.Add(Path.GetFullPath(updatedDocument.FilePath));
         }
 
-        return RuntimeDocumentChangeAnalysisResult.Ok(changedFiles.ToImmutable());
-    }
-
-    private static bool HasLineMovingChanges(SourceText oldText, SourceText newText)
-    {
-        var oldPositions = GetLinePositions(oldText);
-        var newPositions = GetLinePositions(newText);
-        foreach (var (line, positions) in oldPositions)
+        var additionalFiles = ImmutableArray.CreateBuilder<string>();
+        foreach (var updatedDocument in updatedProject.AdditionalDocuments)
         {
-            if (!newPositions.TryGetValue(line, out var updatedPositions))
+            var pdbDocument = pdbProject.GetAdditionalDocument(updatedDocument.Id);
+            if (pdbDocument is null || updatedDocument.FilePath is null)
             {
                 continue;
             }
 
-            var sharedCount = Math.Min(positions.Count, updatedPositions.Count);
-            for (var index = 0; index < sharedCount; index++)
+            var pdbText = await pdbDocument.GetTextAsync(cancellationToken);
+            var updatedText = await updatedDocument.GetTextAsync(cancellationToken);
+            if (!pdbText.ContentEquals(updatedText))
             {
-                if (positions[index] != updatedPositions[index])
-                {
-                    return true;
-                }
+                additionalFiles.Add(Path.GetFullPath(updatedDocument.FilePath));
             }
         }
 
-        var oldSyntaxPositions = GetStableSyntaxLinePositions(oldText);
-        var newSyntaxPositions = GetStableSyntaxLinePositions(newText);
-        foreach (var (identity, positions) in oldSyntaxPositions)
-        {
-            if (!newSyntaxPositions.TryGetValue(identity, out var updatedPositions))
-            {
-                continue;
-            }
-
-            var sharedCount = Math.Min(positions.Count, updatedPositions.Count);
-            for (var index = 0; index < sharedCount; index++)
-            {
-                if (positions[index] != updatedPositions[index])
-                {
-                    return true;
-                }
-            }
-        }
-
-        return false;
+        return RuntimeDocumentChangeAnalysisResult.Ok(
+            changedFiles.ToImmutable(),
+            additionalFiles.ToImmutable());
     }
 
-    private static Dictionary<string, List<int>> GetLinePositions(SourceText text)
-    {
-        var result = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        for (var index = 0; index < text.Lines.Count; index++)
-        {
-            var line = text.Lines[index].ToString();
-            if (!result.TryGetValue(line, out var positions))
-            {
-                positions = [];
-                result.Add(line, positions);
-            }
-
-            positions.Add(index);
-        }
-
-        return result;
-    }
-
-    private static Dictionary<string, List<int>> GetStableSyntaxLinePositions(SourceText text)
-    {
-        var tree = CSharpSyntaxTree.ParseText(text);
-        var root = tree.GetRoot();
-        var result = new Dictionary<string, List<int>>(StringComparer.Ordinal);
-        foreach (var node in root.DescendantNodes())
-        {
-            string? identity = node switch
-            {
-                BaseMethodDeclarationSyntax method => "method:" + MethodIdentity(method),
-                BasePropertyDeclarationSyntax property => "property:" + PropertyIdentity(property),
-                AccessorDeclarationSyntax accessor => "accessor:" + AccessorIdentity(accessor),
-                ArrowExpressionClauseSyntax arrow => "arrow:" + ArrowExpressionIdentity(arrow),
-                LambdaExpressionSyntax lambda => "lambda:" + LambdaIdentity(lambda),
-                LocalFunctionStatementSyntax localFunction => "local-function:" + LocalFunctionIdentity(localFunction),
-                LocalDeclarationStatementSyntax local => "local:" + LocalIdentity(local),
-                BaseFieldDeclarationSyntax field => "field:" + FieldIdentity(field),
-                StatementSyntax statement => "statement:" + StatementIdentity(statement),
-                _ => null
-            };
-            if (identity is null)
-            {
-                continue;
-            }
-
-            if (!result.TryGetValue(identity, out var positions))
-            {
-                positions = [];
-                result.Add(identity, positions);
-            }
-
-            var positionNode = node switch
-            {
-                ArrowExpressionClauseSyntax arrowClause => arrowClause.Expression,
-                LambdaExpressionSyntax { Body: ExpressionSyntax expression } => expression,
-                _ => node
-            };
-            positions.Add(tree.GetLineSpan(positionNode.Span).StartLinePosition.Line);
-        }
-
-        return result;
-    }
-
-    private static string MethodIdentity(BaseMethodDeclarationSyntax method)
-    {
-        var name = method switch
-        {
-            MethodDeclarationSyntax declaration =>
-                $"{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}`{declaration.TypeParameterList?.Parameters.Count ?? 0}",
-            ConstructorDeclarationSyntax => ".ctor",
-            DestructorDeclarationSyntax => ".dtor",
-            OperatorDeclarationSyntax declaration => $"operator {declaration.OperatorToken.ValueText}",
-            ConversionOperatorDeclarationSyntax declaration =>
-                $"{declaration.ImplicitOrExplicitKeyword.ValueText} operator {declaration.Type.WithoutTrivia()}",
-            _ => method.Kind().ToString()
-        };
-        return $"{ContainingTypeIdentity(method)}::{name}({ParameterIdentity(method.ParameterList?.Parameters ?? [])})";
-    }
-
-    private static string LocalIdentity(LocalDeclarationStatementSyntax local)
-    {
-        var variables = string.Join(",", local.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
-        return $"{ContainingExecutableIdentity(local)}:{local.Declaration.Type.WithoutTrivia()}:{variables}";
-    }
-
-    private static string LocalFunctionIdentity(LocalFunctionStatementSyntax localFunction) =>
-        $"{ContainingExecutableIdentity(localFunction)}::{localFunction.Identifier.ValueText}`{localFunction.TypeParameterList?.Parameters.Count ?? 0}" +
-        $"({ParameterIdentity(localFunction.ParameterList.Parameters)})";
-
-    private static string StatementIdentity(StatementSyntax statement)
-    {
-        var tokens = statement.DescendantTokens().Select(static token =>
-            token.Parent is LiteralExpressionSyntax
-                ? $"<{token.Kind()}>"
-                : token.ValueText);
-        return $"{ContainingExecutableIdentity(statement)}:{statement.Kind()}:{string.Join("|", tokens)}";
-    }
-
-    private static string FieldIdentity(BaseFieldDeclarationSyntax field)
-    {
-        var variables = string.Join(",", field.Declaration.Variables.Select(static variable => variable.Identifier.ValueText));
-        return $"{ContainingTypeIdentity(field)}:{field.Modifiers}:{field.Declaration.Type.WithoutTrivia()}:{variables}";
-    }
-
-    private static string PropertyIdentity(BasePropertyDeclarationSyntax property) => property switch
-    {
-        PropertyDeclarationSyntax declaration =>
-            $"{ContainingTypeIdentity(declaration)}::{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}:{declaration.Type.WithoutTrivia()}",
-        IndexerDeclarationSyntax declaration =>
-            $"{ContainingTypeIdentity(declaration)}::{declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}this[{ParameterIdentity(declaration.ParameterList.Parameters)}]:{declaration.Type.WithoutTrivia()}",
-        EventDeclarationSyntax declaration =>
-            $"{ContainingTypeIdentity(declaration)}::event {declaration.ExplicitInterfaceSpecifier?.Name.WithoutTrivia()}{declaration.Identifier.ValueText}:{declaration.Type.WithoutTrivia()}",
-        _ => $"{ContainingTypeIdentity(property)}::{property.Kind()}"
-    };
-
-    private static string AccessorIdentity(AccessorDeclarationSyntax accessor)
-    {
-        var property = accessor.Ancestors().OfType<BasePropertyDeclarationSyntax>().FirstOrDefault();
-        return $"{(property is null ? ContainingTypeIdentity(accessor) : PropertyIdentity(property))}:{accessor.Kind()}";
-    }
-
-    private static string ArrowExpressionIdentity(ArrowExpressionClauseSyntax arrow) => arrow.Parent switch
-    {
-        BaseMethodDeclarationSyntax method => MethodIdentity(method),
-        BasePropertyDeclarationSyntax property => PropertyIdentity(property),
-        AccessorDeclarationSyntax accessor => AccessorIdentity(accessor),
-        LocalFunctionStatementSyntax localFunction => LocalFunctionIdentity(localFunction),
-        _ => ContainingExecutableIdentity(arrow)
-    };
-
-    private static string LambdaIdentity(LambdaExpressionSyntax lambda)
-    {
-        var variable = lambda.Ancestors().OfType<VariableDeclaratorSyntax>().FirstOrDefault();
-        SyntaxNode scope = variable
-            ?? lambda.Ancestors().FirstOrDefault(static ancestor => ancestor is
-                BaseMethodDeclarationSyntax or
-                BasePropertyDeclarationSyntax or
-                AccessorDeclarationSyntax or
-                BaseFieldDeclarationSyntax)
-            ?? lambda.SyntaxTree.GetRoot();
-        var owner = variable is null
-            ? ContainingExecutableIdentity(lambda)
-            : $"{ContainingExecutableIdentity(variable)}:variable:{variable.Identifier.ValueText}";
-        var ordinal = scope.DescendantNodes()
-            .OfType<LambdaExpressionSyntax>()
-            .TakeWhile(candidate => !ReferenceEquals(candidate, lambda))
-            .Count();
-        var parameters = lambda switch
-        {
-            SimpleLambdaExpressionSyntax simple => ParameterIdentity([simple.Parameter]),
-            ParenthesizedLambdaExpressionSyntax parenthesized => ParameterIdentity(parenthesized.ParameterList.Parameters),
-            _ => string.Empty
-        };
-        return $"{owner}:lambda:{ordinal}({parameters})";
-    }
-
-    private static string ContainingExecutableIdentity(SyntaxNode node)
-    {
-        var method = node.Ancestors().OfType<BaseMethodDeclarationSyntax>().FirstOrDefault();
-        if (method is not null)
-        {
-            return MethodIdentity(method);
-        }
-
-        var accessor = node.Ancestors().OfType<AccessorDeclarationSyntax>().FirstOrDefault();
-        return accessor is null ? ContainingTypeIdentity(node) : AccessorIdentity(accessor);
-    }
-
-    private static string ContainingTypeIdentity(SyntaxNode node)
-    {
-        var namespaces = node.Ancestors()
-            .OfType<BaseNamespaceDeclarationSyntax>()
-            .Reverse()
-            .Select(static declaration => declaration.Name.WithoutTrivia().ToString());
-        var types = node.Ancestors()
-            .OfType<TypeDeclarationSyntax>()
-            .Reverse()
-            .Select(static type => $"{type.Identifier.ValueText}`{type.TypeParameterList?.Parameters.Count ?? 0}");
-        return string.Join(".", namespaces.Concat(types));
-    }
-
-    private static string ParameterIdentity(IEnumerable<ParameterSyntax> parameters) => string.Join(
-        ",",
-        parameters.Select(static parameter => $"{parameter.Modifiers}:{parameter.Type?.WithoutTrivia()}"));
-
-    private static string FindPortablePdbPath(string assemblyPath, ImmutableArray<byte> peImage)
+    private static PortablePdbCapture CapturePortablePdb(string assemblyPath, ImmutableArray<byte> peImage)
     {
         using var peReader = new PEReader(peImage);
         var references = peReader.ReadDebugDirectory()
@@ -891,53 +688,58 @@ public sealed class HotReloadDeltaSession : IDisposable
                 return new PortablePdbReference(path, data.Guid, entry.Stamp);
             })
             .ToArray();
-        var matchingReferencedPaths = references
-            .Where(reference =>
-                File.Exists(reference.Path) &&
-                PortablePdbMatches(reference.Path, [reference]))
-            .Select(static reference => reference.Path)
-            .Distinct(PathComparer)
+        var matchingReferencedPdbs = references
+            .Where(reference => File.Exists(reference.Path))
+            .Select(reference => TryCapturePortablePdb(reference.Path, [reference]))
+            .Where(static capture => capture is not null)
+            .Select(static capture => capture!)
+            .DistinctBy(static capture => capture.Path, PathComparer)
             .ToArray();
-        if (matchingReferencedPaths.Length == 1)
+        if (matchingReferencedPdbs.Length == 1)
         {
-            return matchingReferencedPaths[0];
+            return matchingReferencedPdbs[0];
         }
 
         var siblingPdb = Path.ChangeExtension(assemblyPath, ".pdb");
-        if (matchingReferencedPaths.Length == 0 &&
+        if (matchingReferencedPdbs.Length == 0 &&
             references.Length > 0 &&
-            File.Exists(siblingPdb) &&
-            PortablePdbMatches(siblingPdb, references))
+            File.Exists(siblingPdb))
         {
-            return siblingPdb;
+            var siblingCapture = TryCapturePortablePdb(siblingPdb, references);
+            if (siblingCapture is not null)
+            {
+                return siblingCapture;
+            }
         }
 
         throw new InvalidOperationException(
             "The baseline assembly does not identify exactly one matching external portable PDB.");
     }
 
-    private static bool PortablePdbMatches(
+    private static PortablePdbCapture? TryCapturePortablePdb(
         string pdbPath,
         IReadOnlyList<PortablePdbReference> references)
     {
         try
         {
-            using var stream = File.OpenRead(pdbPath);
-            using var provider = MetadataReaderProvider.FromPortablePdbStream(stream);
+            var image = File.ReadAllBytes(pdbPath).ToImmutableArray();
+            using var provider = MetadataReaderProvider.FromPortablePdbImage(image);
             var header = provider.GetMetadataReader().DebugMetadataHeader;
             if (header is null)
             {
-                return false;
+                return null;
             }
 
             var contentId = new BlobContentId(header.Id);
             return references.Any(reference =>
                 reference.Guid == contentId.Guid &&
-                reference.Stamp == contentId.Stamp);
+                reference.Stamp == contentId.Stamp)
+                ? new(Path.GetFullPath(pdbPath), image, contentId.Guid, contentId.Stamp)
+                : null;
         }
         catch (Exception exception) when (exception is IOException or BadImageFormatException)
         {
-            return false;
+            return null;
         }
     }
 
@@ -992,8 +794,8 @@ public sealed class HotReloadDeltaSession : IDisposable
             .Select(Path.GetFullPath)
             .ToHashSet(PathComparer);
         var updatedMethodSet = updatedMethods.ToHashSet();
-        var oldPoints = ReadSequencePoints(baselinePdb);
-        var newPoints = ReadSequencePoints(updatedPdb);
+        var oldPdb = ReadPortablePdbData(baselinePdb);
+        var newPdb = ReadPortablePdbData(updatedPdb);
         var mappings = new Dictionary<string, Dictionary<int, int>>(PathComparer);
         var reverseMappings = new Dictionary<string, Dictionary<int, int>>(PathComparer);
         var includesUpdatedMethods = false;
@@ -1006,14 +808,36 @@ public sealed class HotReloadDeltaSession : IDisposable
             changedPaths,
             cancellationToken);
 
-        var resolvedOldPoints = ResolveChangedDocumentPoints(oldPoints, changedPaths, committedDocuments);
-        var resolvedNewPoints = ResolveChangedDocumentPoints(newPoints, changedPaths, updatedDocuments);
+        var committedChecksums = committedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var updatedChecksums = updatedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var resolvedOldDocuments = ResolveChangedDocumentPaths(
+            oldPdb.Documents,
+            changedPaths,
+            committedChecksums);
+        var resolvedNewDocuments = ResolveChangedDocumentPaths(
+            newPdb.Documents,
+            changedPaths,
+            updatedChecksums);
+        var resolvedOldPoints = ResolveChangedDocumentPoints(
+            oldPdb.SequencePoints,
+            changedPaths,
+            committedChecksums);
+        var resolvedNewPoints = ResolveChangedDocumentPoints(
+            newPdb.SequencePoints,
+            changedPaths,
+            updatedChecksums);
         var unresolvedOldPaths = FindMissingPaths(
             changedPaths,
-            resolvedOldPoints.Select(static point => point.FilePath));
+            resolvedOldDocuments);
         var unresolvedNewPaths = FindMissingPaths(
             changedPaths,
-            resolvedNewPoints.Select(static point => point.FilePath));
+            resolvedNewDocuments);
         if (!unresolvedOldPaths.IsEmpty || !unresolvedNewPaths.IsEmpty)
         {
             var unresolvedPaths = unresolvedOldPaths.Concat(unresolvedNewPaths).Distinct(PathComparer);
@@ -1083,6 +907,101 @@ public sealed class HotReloadDeltaSession : IDisposable
         return ExactLineUpdateResult.Ok(lineUpdates, includesUpdatedMethods);
     }
 
+    private async Task<AdditionalDocumentValidationResult> ValidateAdditionalDocumentPositionsAsync(
+        Project committedProject,
+        Project updatedProject,
+        ImmutableArray<byte> updatedPdb,
+        ImmutableArray<string> changedFiles,
+        CancellationToken cancellationToken)
+    {
+        var changedPaths = changedFiles
+            .Select(Path.GetFullPath)
+            .ToHashSet(PathComparer);
+        var committedChecksums = await ReadAdditionalDocumentChecksumsAsync(
+            committedProject,
+            changedPaths,
+            cancellationToken);
+        var updatedChecksums = await ReadAdditionalDocumentChecksumsAsync(
+            updatedProject,
+            changedPaths,
+            cancellationToken);
+        var oldPdb = ReadPortablePdbData(baselinePdb);
+        var newPdb = ReadPortablePdbData(updatedPdb);
+        var resolvedOldDocuments = ResolveChangedDocumentPaths(
+            oldPdb.Documents,
+            changedPaths,
+            committedChecksums);
+        var resolvedNewDocuments = ResolveChangedDocumentPaths(
+            newPdb.Documents,
+            changedPaths,
+            updatedChecksums);
+        var unresolvedOldPaths = FindMissingPaths(changedPaths, resolvedOldDocuments);
+        var unresolvedNewPaths = FindMissingPaths(changedPaths, resolvedNewDocuments);
+        if (!unresolvedOldPaths.IsEmpty || !unresolvedNewPaths.IsEmpty)
+        {
+            var unresolvedPaths = unresolvedOldPaths.Concat(unresolvedNewPaths).Distinct(PathComparer);
+            return AdditionalDocumentValidationResult.Fail(
+                $"Generated or additional document positions could not be resolved in both portable PDB generations: {string.Join(", ", unresolvedPaths)}");
+        }
+
+        var resolvedOldPoints = ResolveChangedDocumentPoints(
+            oldPdb.SequencePoints,
+            changedPaths,
+            committedChecksums);
+        var resolvedNewPoints = ResolveChangedDocumentPoints(
+            newPdb.SequencePoints,
+            changedPaths,
+            updatedChecksums);
+        foreach (var path in changedPaths)
+        {
+            var oldLines = resolvedOldPoints
+                .Where(point => !point.Hidden && PathComparer.Equals(point.FilePath, path))
+                .Select(static point => point.StartLine)
+                .Distinct()
+                .Order()
+                .ToArray();
+            var newLines = resolvedNewPoints
+                .Where(point => !point.Hidden && PathComparer.Equals(point.FilePath, path))
+                .Select(static point => point.StartLine)
+                .Distinct()
+                .Order()
+                .ToArray();
+            if (!oldLines.SequenceEqual(newLines))
+            {
+                return AdditionalDocumentValidationResult.Fail(
+                    $"Visible sequence-point positions changed ambiguously in generated or additional document '{path}' and cannot be correlated exactly; restart/replay is required.");
+            }
+        }
+
+        return AdditionalDocumentValidationResult.Ok();
+    }
+
+    private static async Task<Dictionary<string, ImmutableArray<byte>>> ReadAdditionalDocumentChecksumsAsync(
+        Project project,
+        IReadOnlySet<string> changedPaths,
+        CancellationToken cancellationToken)
+    {
+        var result = new Dictionary<string, ImmutableArray<byte>>(PathComparer);
+        foreach (var document in project.AdditionalDocuments)
+        {
+            if (document.FilePath is null)
+            {
+                continue;
+            }
+
+            var path = Path.GetFullPath(document.FilePath);
+            if (!changedPaths.Contains(path))
+            {
+                continue;
+            }
+
+            var text = await document.GetTextAsync(cancellationToken);
+            result.Add(path, text.GetChecksum());
+        }
+
+        return result;
+    }
+
     private static ImmutableArray<string> FindMissingPaths(
         IEnumerable<string> requiredPaths,
         IEnumerable<string> observedPaths)
@@ -1097,12 +1016,8 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static ImmutableArray<PortableSequencePoint> ResolveChangedDocumentPoints(
         ImmutableArray<PortableSequencePoint> points,
         HashSet<string> changedPaths,
-        Dictionary<string, DocumentSyntaxSnapshot> documents)
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums)
     {
-        var documentChecksums = documents.ToDictionary(
-            static pair => pair.Key,
-            static pair => pair.Value.Checksum,
-            PathComparer);
         var result = ImmutableArray.CreateBuilder<PortableSequencePoint>();
         foreach (var point in points)
         {
@@ -1119,6 +1034,21 @@ public sealed class HotReloadDeltaSession : IDisposable
 
         return result.ToImmutable();
     }
+
+    private static ImmutableArray<string> ResolveChangedDocumentPaths(
+        ImmutableArray<PortablePdbDocument> documents,
+        IReadOnlySet<string> changedPaths,
+        IReadOnlyDictionary<string, ImmutableArray<byte>> documentChecksums) =>
+        documents
+            .Select(document => ResolveChangedDocumentPath(
+                document.FilePath,
+                document.Checksum,
+                changedPaths,
+                documentChecksums))
+            .Where(static path => path is not null)
+            .Select(static path => path!)
+            .Distinct(PathComparer)
+            .ToImmutableArray();
 
     private static string? ResolveChangedDocumentPath(
         string pdbDocumentPath,
@@ -1418,12 +1348,21 @@ public sealed class HotReloadDeltaSession : IDisposable
         return null;
     }
 
-    private static ImmutableArray<PortableSequencePoint> ReadSequencePoints(
+    private static PortablePdbData ReadPortablePdbData(
         ImmutableArray<byte> pdbImage)
     {
         using var provider = MetadataReaderProvider.FromPortablePdbImage(pdbImage);
         var reader = provider.GetMetadataReader();
-        var result = ImmutableArray.CreateBuilder<PortableSequencePoint>();
+        var documents = reader.Documents
+            .Select(handle =>
+            {
+                var document = reader.GetDocument(handle);
+                return new PortablePdbDocument(
+                    reader.GetString(document.Name),
+                    reader.GetBlobBytes(document.Hash).ToImmutableArray());
+            })
+            .ToImmutableArray();
+        var points = ImmutableArray.CreateBuilder<PortableSequencePoint>();
         var methodCount = reader.GetTableRowCount(TableIndex.MethodDebugInformation);
         for (var row = 1; row <= methodCount; row++)
         {
@@ -1440,7 +1379,7 @@ public sealed class HotReloadDeltaSession : IDisposable
 
                 var document = reader.GetDocument(documentHandle);
                 var filePath = reader.GetString(document.Name);
-                result.Add(new(
+                points.Add(new(
                     methodToken,
                     point.Offset,
                     filePath,
@@ -1453,7 +1392,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
         }
 
-        return result.ToImmutable();
+        return new(documents, points.ToImmutable());
     }
 
     private static string? ValidateMethodTokenIdentity(
@@ -1647,6 +1586,20 @@ public sealed class HotReloadDeltaSession : IDisposable
 
     private sealed record PortablePdbReference(string Path, Guid Guid, uint Stamp);
 
+    private sealed record PortablePdbCapture(
+        string Path,
+        ImmutableArray<byte> Image,
+        Guid Guid,
+        uint Stamp);
+
+    private sealed record PortablePdbDocument(
+        string FilePath,
+        ImmutableArray<byte> Checksum);
+
+    private sealed record PortablePdbData(
+        ImmutableArray<PortablePdbDocument> Documents,
+        ImmutableArray<PortableSequencePoint> SequencePoints);
+
     private sealed record DocumentSyntaxSnapshot(
         string FilePath,
         SyntaxNode Root,
@@ -1687,13 +1640,23 @@ public sealed class HotReloadDeltaSession : IDisposable
     private sealed record RuntimeDocumentChangeAnalysisResult(
         bool Success,
         ImmutableArray<string> Files,
+        ImmutableArray<string> AdditionalFiles,
         string? Error)
     {
-        public static RuntimeDocumentChangeAnalysisResult Ok(ImmutableArray<string> files) =>
-            new(true, files, null);
+        public static RuntimeDocumentChangeAnalysisResult Ok(
+            ImmutableArray<string> files,
+            ImmutableArray<string> additionalFiles) =>
+            new(true, files, additionalFiles, null);
 
         public static RuntimeDocumentChangeAnalysisResult Fail(string error) =>
-            new(false, [], error);
+            new(false, [], [], error);
+    }
+
+    private sealed record AdditionalDocumentValidationResult(bool Success, string? Error)
+    {
+        public static AdditionalDocumentValidationResult Ok() => new(true, null);
+
+        public static AdditionalDocumentValidationResult Fail(string error) => new(false, error);
     }
 
     private sealed record FullPdbResult(

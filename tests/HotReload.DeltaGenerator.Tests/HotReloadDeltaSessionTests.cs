@@ -82,6 +82,36 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsEqualLengthRazorMoveWhenChangedTextHasNoStableIdentity()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await RazorProjectFixture.CreateAsync(
+            cancellationToken,
+            RazorProjectFixture.MovedExpressionBaseline);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, RazorProjectFixture.MovedExpressionUpdated)
+        ], cancellationToken);
+
+        Assert.Equal(
+            RazorProjectFixture.MovedExpressionBaseline.Split('\n').Length,
+            RazorProjectFixture.MovedExpressionUpdated.Split('\n').Length);
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Empty(update.MetadataDelta);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning =>
+            warning.Contains("sequence-point positions", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task Session_DoesNotTreatRazorMarkupBeginningWithLineAsCSharpDirective()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -212,6 +242,39 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Contains(next.LineUpdates, lineUpdate =>
             lineUpdate.OldLine == FindLine(ProjectFixture.Source(1), "public static int Unchanged()") &&
             lineUpdate.NewLine == FindLine(nextSource, "public static int Unchanged()"));
+        session.DiscardUpdate();
+    }
+
+    [Fact]
+    public async Task Session_TreatsDocumentWithNoSequencePointsAsVacuouslyMapped()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(
+            ProjectFixture.Source(1),
+            cancellationToken,
+            additionalSource: ProjectFixture.InterfaceOnlySource(updated: false));
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var noDelta = await session.PrepareUpdateAsync([
+            new(fixture.SecondaryPath, ProjectFixture.InterfaceOnlySource(updated: true))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.NoChanges, noDelta.Status);
+        Assert.False(session.HasPendingUpdate);
+
+        var emitting = await session.PrepareUpdateAsync([
+            new(fixture.SourcePath, ProjectFixture.Source(2))
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.Ready, emitting.Status);
+        Assert.True(emitting.LineUpdatesComplete);
+        Assert.Empty(emitting.LineUpdates);
         session.DiscardUpdate();
     }
 
@@ -454,7 +517,6 @@ public sealed class HotReloadDeltaSessionTests
         var cancellationToken = TestContext.Current.CancellationToken;
         var baseline = ProjectFixture.BlankPermutationSource(1, updated: false);
         var updated = ProjectFixture.BlankPermutationSource(2, updated: true);
-        Assert.True(DetectLineMovement(baseline, updated));
         using var fixture = await ProjectFixture.CreateAsync(baseline, cancellationToken);
         using var session = await HotReloadDeltaSession.StartAsync(
             fixture.ProjectPath,
@@ -471,18 +533,6 @@ public sealed class HotReloadDeltaSessionTests
         Assert.Equal(HotReloadDeltaUpdateStatus.Ready, update.Status);
         Assert.Empty(update.LineUpdates);
         session.DiscardUpdate();
-    }
-
-    [Theory]
-    [InlineData(true)]
-    [InlineData(false)]
-    public void Session_DetectsExpressionBodiedLambdaMovement(bool fieldLambda)
-    {
-        var baseline = ProjectFixture.ExpressionLambdaSource(fieldLambda, shifted: false);
-        var updated = ProjectFixture.ExpressionLambdaSource(fieldLambda, shifted: true);
-
-        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
-        Assert.True(DetectLineMovement(baseline, updated));
     }
 
     [Fact]
@@ -716,40 +766,6 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
-    public void Session_DetectsReorderedChangedFieldInitializersAsLineMovement()
-    {
-        var baseline = ProjectFixture.ReorderedFieldInitializersSource(1, 2, reverse: false);
-        var updated = ProjectFixture.ReorderedFieldInitializersSource(3, 4, reverse: true);
-
-        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
-        Assert.True(DetectLineMovement(baseline, updated));
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Session_DetectsReorderedChangedPropertiesAsLineMovement(bool expressionBodied)
-    {
-        var baseline = ProjectFixture.ReorderedPropertiesSource(1, 2, reverse: false, expressionBodied);
-        var updated = ProjectFixture.ReorderedPropertiesSource(3, 4, reverse: true, expressionBodied);
-
-        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
-        Assert.True(DetectLineMovement(baseline, updated));
-    }
-
-    [Theory]
-    [InlineData(false)]
-    [InlineData(true)]
-    public void Session_DetectsMovedArrowExpressionsWithinStableDeclarations(bool property)
-    {
-        var baseline = ProjectFixture.ShiftedArrowExpressionSource(property, updated: false);
-        var updated = ProjectFixture.ShiftedArrowExpressionSource(property, updated: true);
-
-        Assert.Equal(baseline.Split('\n').Length, updated.Split('\n').Length);
-        Assert.True(DetectLineMovement(baseline, updated));
-    }
-
-    [Fact]
     public async Task Session_DistinguishesFunctionPointerCallingConventionsInTokenIdentities()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -834,6 +850,29 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_PortablePdbCaptureRetainsTheValidatedBytes()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await ProjectFixture.CreateAsync(ProjectFixture.Source(1), cancellationToken);
+        using var otherFixture = await RazorProjectFixture.CreateAsync(cancellationToken);
+        var assemblyPath = Path.Combine(fixture.Root, "bin", "Debug", "net10.0", "DeltaFixture.dll");
+        var pdbPath = ReadCodeViewPath(assemblyPath);
+        var originalBytes = await File.ReadAllBytesAsync(pdbPath, cancellationToken);
+        var captureMethod = typeof(HotReloadDeltaSession).GetMethod(
+            "CapturePortablePdb",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var assemblyBytes = (await File.ReadAllBytesAsync(assemblyPath, cancellationToken)).ToImmutableArray();
+        var capture = captureMethod.Invoke(null, [assemblyPath, assemblyBytes])!;
+
+        var otherPdbPath = Path.Combine(otherFixture.Root, "bin", "Debug", "net10.0", "RazorDeltaFixture.pdb");
+        File.Copy(otherPdbPath, pdbPath, overwrite: true);
+
+        var capturedImage = (ImmutableArray<byte>)capture.GetType().GetProperty("Image")!.GetValue(capture)!;
+        Assert.Equal(originalBytes, capturedImage.ToArray());
+        Assert.NotEqual(await File.ReadAllBytesAsync(pdbPath, cancellationToken), capturedImage.ToArray());
+    }
+
+    [Fact]
     public async Task Session_PortablePdbLookupRejectsFileThatDoesNotMatchBaselineAssembly()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -850,7 +889,7 @@ public sealed class HotReloadDeltaSessionTests
         }
 
         var finder = typeof(HotReloadDeltaSession).GetMethod(
-            "FindPortablePdbPath",
+            "CapturePortablePdb",
             BindingFlags.NonPublic | BindingFlags.Static)!;
         var assemblyBytes = (await File.ReadAllBytesAsync(assemblyPath, cancellationToken)).ToImmutableArray();
         var exception = Assert.Throws<TargetInvocationException>(() => finder.Invoke(null, [
@@ -1685,17 +1724,6 @@ public sealed class HotReloadDeltaSessionTests
                 : Path.Combine(Path.GetDirectoryName(assemblyPath)!, path));
     }
 
-    private static bool DetectLineMovement(string baseline, string updated)
-    {
-        var detector = typeof(HotReloadDeltaSession).GetMethod(
-            "HasLineMovingChanges",
-            BindingFlags.NonPublic | BindingFlags.Static)!;
-        return (bool)detector.Invoke(null, [
-            SourceText.From(baseline),
-            SourceText.From(updated)
-        ])!;
-    }
-
     private static async Task<string> ReadSessionDocumentAsync(
         HotReloadDeltaSession session,
         string fieldName,
@@ -1755,6 +1783,26 @@ public sealed class HotReloadDeltaSessionTests
             @code {
                 private int value;
                 private void Increment() => value += 3;
+            }
+            """;
+
+        public const string MovedExpressionBaseline = """
+            @namespace RazorDeltaFixture
+            @* old *@
+            <p>@A(1)</p>
+            @code {
+                private int A(int value) => value;
+                private int B(int value) => value;
+            }
+            """;
+
+        public const string MovedExpressionUpdated = """
+            @namespace RazorDeltaFixture
+            <p>@B(2)</p>
+            @* new *@
+            @code {
+                private int A(int value) => value;
+                private int B(int value) => value;
             }
             """;
 
@@ -2241,6 +2289,24 @@ public sealed class HotReloadDeltaSessionTests
                 "        var seed = input + 1;",
                 "        // seed removed",
                 StringComparison.Ordinal);
+
+        public static string InterfaceOnlySource(bool updated) => updated
+            ? """
+                namespace DeltaFixture;
+
+                // updated documentation
+                public interface IMarker
+                {
+                }
+                """
+            : """
+                namespace DeltaFixture;
+
+                // baseline documentation
+                public interface IMarker
+                {
+                }
+                """;
 
         public static string ReorderedExpressionStatementsSource(int first, int second, bool reverseCalls)
         {
