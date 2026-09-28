@@ -332,9 +332,7 @@ public sealed class HotReloadDeltaSession : IDisposable
             return RestartRequired(normalizedChanges, runtimeDocumentChanges.Error!);
         }
 
-        var runtimeChangedFiles = runtimeDocumentChanges.Files
-            .Concat(runtimeDocumentChanges.GeneratedFiles)
-            .ToHashSet(PathComparer);
+        var runtimeChangedFiles = runtimeDocumentChanges.Files.ToHashSet(PathComparer);
 
         var updates = await hotReloadService.GetUpdatesAsync(
             updatedSolution,
@@ -439,6 +437,13 @@ public sealed class HotReloadDeltaSession : IDisposable
                 hotReloadService.DiscardUpdate();
                 return RestartRequired(normalizedChanges, tokenValidation);
             }
+
+            runtimeChangedFiles.UnionWith(await FindGeneratedFilesWithVisiblePdbPointsAsync(
+                pdbSolution.GetProject(projectId)!,
+                updatedSolution.GetProject(projectId)!,
+                fullPdb.Pdb,
+                runtimeDocumentChanges.GeneratedFiles,
+                cancellationToken));
 
             ImmutableArray<HotReloadDeltaLineUpdate> lineUpdates = [];
             var includesUpdatedMethodMappings = false;
@@ -865,6 +870,57 @@ public sealed class HotReloadDeltaSession : IDisposable
         return FullPdbResult.Ok(
             peStream.ToArray().ToImmutableArray(),
             pdbStream.ToArray().ToImmutableArray());
+    }
+
+    private async Task<ImmutableArray<string>> FindGeneratedFilesWithVisiblePdbPointsAsync(
+        Project committedProject,
+        Project updatedProject,
+        ImmutableArray<byte> updatedPdb,
+        ImmutableArray<string> generatedFiles,
+        CancellationToken cancellationToken)
+    {
+        if (generatedFiles.IsEmpty)
+        {
+            return [];
+        }
+
+        var generatedPaths = generatedFiles
+            .Select(Path.GetFullPath)
+            .ToHashSet(PathComparer);
+        var committedDocuments = await ReadSyntaxDocumentsAsync(
+            committedProject,
+            generatedPaths,
+            cancellationToken);
+        var updatedDocuments = await ReadSyntaxDocumentsAsync(
+            updatedProject,
+            generatedPaths,
+            cancellationToken);
+        var committedChecksums = committedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var updatedChecksums = updatedDocuments.ToDictionary(
+            static pair => pair.Key,
+            static pair => pair.Value.Checksum,
+            PathComparer);
+        var oldPdb = ReadPortablePdbData(baselinePdb);
+        var newPdb = ReadPortablePdbData(updatedPdb);
+        var visiblePaths = ResolveChangedDocumentPoints(
+                oldPdb.SequencePoints,
+                generatedPaths,
+                committedChecksums)
+            .Concat(ResolveChangedDocumentPoints(
+                newPdb.SequencePoints,
+                generatedPaths,
+                updatedChecksums))
+            .Where(static point => !point.Hidden)
+            .Select(static point => point.FilePath)
+            .ToHashSet(PathComparer);
+
+        return generatedFiles
+            .Where(visiblePaths.Contains)
+            .Distinct(PathComparer)
+            .ToImmutableArray();
     }
 
     private async Task<ExactLineUpdateResult> CreateExactLineUpdatesAsync(

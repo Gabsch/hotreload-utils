@@ -426,6 +426,45 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_DoesNotRequireGeneratedPdbEntryWhenVisiblePointsAreFullyLineMapped()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(
+            cancellationToken,
+            SourceGeneratorProjectFixture.InputSource(
+                generatedLines: 0,
+                value: 1,
+                generatedLineDirective: 1),
+            "        return 10;");
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var generatedDocument = (await baselineProject.GetSourceGeneratedDocumentsAsync(cancellationToken))
+            .Single(document => document.Name == "GeneratedCalculator.g.cs");
+        var baselinePdb = (ImmutableArray<byte>)typeof(HotReloadDeltaSession)
+            .GetField("baselinePdb", BindingFlags.NonPublic | BindingFlags.Instance)!
+            .GetValue(session)!;
+
+        var filesWithIndependentPoints = await FindGeneratedFilesWithVisiblePdbPointsAsync(
+            session,
+            baselineProject,
+            baselineProject,
+            baselinePdb,
+            [Path.GetFullPath(generatedDocument.FilePath!)],
+            cancellationToken);
+
+        Assert.Empty(filesWithIndependentPoints);
+    }
+
+    [Fact]
     public async Task Session_DoesNotCreateRelocationDebtForUnchangedSourceGeneratedDocument()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -2106,6 +2145,28 @@ public sealed class HotReloadDeltaSessionTests
         return analysisTask.GetType().GetProperty("Result")!.GetValue(analysisTask)!;
     }
 
+    private static async Task<ImmutableArray<string>> FindGeneratedFilesWithVisiblePdbPointsAsync(
+        HotReloadDeltaSession session,
+        Microsoft.CodeAnalysis.Project baselineProject,
+        Microsoft.CodeAnalysis.Project updatedProject,
+        ImmutableArray<byte> updatedPdb,
+        ImmutableArray<string> generatedFiles,
+        CancellationToken cancellationToken)
+    {
+        var find = typeof(HotReloadDeltaSession).GetMethod(
+            "FindGeneratedFilesWithVisiblePdbPointsAsync",
+            BindingFlags.NonPublic | BindingFlags.Instance)!;
+        var findTask = (Task)find.Invoke(session, [
+            baselineProject,
+            updatedProject,
+            updatedPdb,
+            generatedFiles,
+            cancellationToken
+        ])!;
+        await findTask;
+        return (ImmutableArray<string>)findTask.GetType().GetProperty("Result")!.GetValue(findTask)!;
+    }
+
     private sealed class RazorProjectFixture : IDisposable
     {
         private RazorProjectFixture(string root)
@@ -2342,7 +2403,10 @@ public sealed class HotReloadDeltaSessionTests
             }
             """;
 
-        public static async Task<SourceGeneratorProjectFixture> CreateAsync(CancellationToken cancellationToken)
+        public static async Task<SourceGeneratorProjectFixture> CreateAsync(
+            CancellationToken cancellationToken,
+            string? initialSource = null,
+            string initialAdditionalSource = "baseline")
         {
             var root = Path.Combine(Path.GetTempPath(), "hotreload-source-generator-tests", Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(root);
@@ -2407,18 +2471,18 @@ public sealed class HotReloadDeltaSessionTests
                             .Single();
                         var padding = string.Concat(Enumerable.Repeat("        // generated padding\n", generatedLines));
                         var lineDirective = generatedLineSpanDirective != 0
-                            ? "        #line (1,1)-(1,10) \"untracked.cs\"\n"
+                            ? "#line (1,1)-(1,10) \"untracked.cs\"\n"
                             : generatedLineDirective == 0
                                 ? string.Empty
-                                : $"        #line {generatedLineDirective} \"input.cs\"\n";
+                                : $"#line {generatedLineDirective} \"input.cs\"\n";
                         var source = $$"""
                             namespace GeneratedDeltaFixture;
 
-                            public static class GeneratedCalculator
+                            {{lineDirective}}public static class GeneratedCalculator
                             {
                                 public static int GetValue()
                                 {
-                            {{padding}}{{lineDirective}}        return 10;
+                            {{padding}}        return 10;
                                 }
                             }
                             """;
@@ -2445,9 +2509,9 @@ public sealed class HotReloadDeltaSessionTests
                 """, cancellationToken);
             await File.WriteAllTextAsync(
                 fixture.SourcePath,
-                InputSource(generatedLines: 0, value: 1),
+                initialSource ?? InputSource(generatedLines: 0, value: 1),
                 cancellationToken);
-            await File.WriteAllTextAsync(fixture.AdditionalPath, "baseline", cancellationToken);
+            await File.WriteAllTextAsync(fixture.AdditionalPath, initialAdditionalSource, cancellationToken);
 
             var startInfo = new ProcessStartInfo
             {
