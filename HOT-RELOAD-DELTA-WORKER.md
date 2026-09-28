@@ -15,9 +15,13 @@ the worker can prove a complete, unambiguous mapping from committed and updated
 source/PDB evidence. Ambiguous mappings, `#line` directives, and unsupported
 document changes are classified as restart-required before a delta is exposed.
 Line-moving Razor updates require restart when generated sequence points cannot
-be tied to Razor syntax identity. Updates that change the method-definition
-table also require restart so a full-PDB baseline can never drift from the
-runtime's EnC method tokens.
+be tied one-to-one to Razor syntax identity; visible-point multiplicity and
+ordering are preserved rather than compared as distinct line sets. Changed
+source-generated C# documents participate in the same runtime-document analysis
+and exact sequence-point mapping. Added, removed, pathless, or otherwise
+unmappable generated documents require restart. Updates that change the
+method-definition table also require restart so a full-PDB baseline can never
+drift from the runtime's EnC method tokens.
 
 The original CLI and generator behavior remain available. The worker does not treat
 the experimental CLI as its production boundary.
