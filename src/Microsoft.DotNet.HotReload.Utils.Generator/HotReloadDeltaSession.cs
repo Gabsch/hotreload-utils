@@ -621,27 +621,39 @@ public sealed class HotReloadDeltaSession : IDisposable
         CSharpSyntaxTree.ParseText(text)
             .GetRoot()
             .DescendantTrivia(descendIntoTrivia: true)
-            .Any(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia));
+            .Any(static trivia =>
+                trivia.IsKind(SyntaxKind.LineDirectiveTrivia) ||
+                trivia.IsKind(SyntaxKind.LineSpanDirectiveTrivia));
 
     private static bool ContainsUnaccountedLineDirective(
         SourceText text,
-        IEnumerable<string> changedAdditionalFiles)
+        IEnumerable<string> changedAdditionalFiles,
+        string? projectDirectory)
     {
         var accountedPaths = changedAdditionalFiles.ToHashSet(PathComparer);
         return CSharpSyntaxTree.ParseText(text)
             .GetRoot()
             .DescendantTrivia(descendIntoTrivia: true)
-            .Where(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia))
-            .Select(static trivia => (LineDirectiveTriviaSyntax)trivia.GetStructure()!)
-            .Any(directive =>
+            .Where(static trivia =>
+                trivia.IsKind(SyntaxKind.LineDirectiveTrivia) ||
+                trivia.IsKind(SyntaxKind.LineSpanDirectiveTrivia))
+            .Any(trivia =>
             {
-                if (directive.Line.IsKind(SyntaxKind.DefaultKeyword) ||
-                    directive.Line.IsKind(SyntaxKind.HiddenKeyword))
+                var structure = trivia.GetStructure();
+                if (structure is LineDirectiveTriviaSyntax directive &&
+                    (directive.Line.IsKind(SyntaxKind.DefaultKeyword) ||
+                     directive.Line.IsKind(SyntaxKind.HiddenKeyword)))
                 {
                     return false;
                 }
 
-                var mappedPath = TryGetFullPath(directive.File.ValueText);
+                var mappedFile = structure switch
+                {
+                    LineDirectiveTriviaSyntax lineDirective => lineDirective.File.ValueText,
+                    LineSpanDirectiveTriviaSyntax lineSpanDirective => lineSpanDirective.File.ValueText,
+                    _ => string.Empty
+                };
+                var mappedPath = TryGetFullPath(mappedFile, projectDirectory);
                 return mappedPath is null || !accountedPaths.Contains(mappedPath);
             });
     }
@@ -722,8 +734,9 @@ public sealed class HotReloadDeltaSession : IDisposable
                 continue;
             }
 
-            if (ContainsUnaccountedLineDirective(committedText, additionalFiles) ||
-                ContainsUnaccountedLineDirective(updatedText, additionalFiles))
+            var projectDirectory = Path.GetDirectoryName(updatedProject.FilePath ?? pdbProject.FilePath);
+            if (ContainsUnaccountedLineDirective(committedText, additionalFiles, projectDirectory) ||
+                ContainsUnaccountedLineDirective(updatedText, additionalFiles, projectDirectory))
             {
                 return RuntimeDocumentChangeAnalysisResult.Fail(
                     $"Changed source-generated document '{updatedDocument.Name}' contains #line mappings that are not owned by a changed additional document and cannot be correlated exactly; restart/replay is required.");
@@ -1178,9 +1191,16 @@ public sealed class HotReloadDeltaSession : IDisposable
     private static string? CreateSourcePointAnchor(PortableSequencePoint point, SourceText text)
     {
         var source = ReadSourcePointText(point, text);
-        return source is null
-            ? null
-            : string.Concat(source.Where(static character => !char.IsWhiteSpace(character)));
+        if (source is null)
+        {
+            return null;
+        }
+
+        var tokens = SyntaxFactory.ParseTokens(source)
+            .Where(static token => !token.IsKind(SyntaxKind.EndOfFileToken))
+            .Select(static token => $"{token.RawKind}:{token.Text.Length}:{token.Text}")
+            .ToArray();
+        return tokens.Length == 0 ? null : string.Join('|', tokens);
     }
 
     private static string? ReadSourcePointText(PortableSequencePoint point, SourceText text)
@@ -1281,11 +1301,14 @@ public sealed class HotReloadDeltaSession : IDisposable
         return checksumMatches.Length == 1 ? checksumMatches[0] : null;
     }
 
-    private static string? TryGetFullPath(string path)
+    private static string? TryGetFullPath(string path, string? baseDirectory = null)
     {
         try
         {
-            return Path.GetFullPath(path);
+            return Path.GetFullPath(
+                !Path.IsPathRooted(path) && !string.IsNullOrWhiteSpace(baseDirectory)
+                    ? Path.Combine(baseDirectory, path)
+                    : path);
         }
         catch (Exception exception) when (exception is ArgumentException or NotSupportedException or PathTooLongException)
         {

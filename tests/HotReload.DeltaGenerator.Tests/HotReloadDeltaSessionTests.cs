@@ -201,6 +201,33 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsRazorPermutationThatDiffersOnlyByLiteralWhitespace()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await RazorProjectFixture.CreateAsync(
+            cancellationToken,
+            RazorProjectFixture.LiteralWhitespaceBaseline);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, RazorProjectFixture.LiteralWhitespaceSwapped)
+        ], cancellationToken);
+
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Empty(update.MetadataDelta);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning =>
+            warning.Contains("identities", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task Session_PreservesSameLineRazorSequencePointMultiplicity()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -320,6 +347,78 @@ public sealed class HotReloadDeltaSessionTests
         ])!;
         await analysisTask;
         var analysis = analysisTask.GetType().GetProperty("Result")!.GetValue(analysisTask)!;
+
+        Assert.False((bool)analysis.GetType().GetProperty("Success")!.GetValue(analysis)!);
+        var error = (string?)analysis.GetType().GetProperty("Error")!.GetValue(analysis);
+        Assert.Contains("#line", error, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Session_ResolvesRelativeGeneratedLineMappingAgainstProjectDirectory()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var inputDocument = baselineProject.Documents.Single(document =>
+            string.Equals(document.FilePath, fixture.SourcePath, StringComparison.OrdinalIgnoreCase));
+        var additionalDocument = baselineProject.AdditionalDocuments.Single(document =>
+            string.Equals(document.FilePath, fixture.AdditionalPath, StringComparison.OrdinalIgnoreCase));
+        var updatedSolution = baselineSolution
+            .WithDocumentText(
+                inputDocument.Id,
+                SourceText.From(SourceGeneratorProjectFixture.InputSource(
+                    generatedLines: 0,
+                    value: 1,
+                    generatedLineDirective: 1)))
+            .WithAdditionalDocumentText(additionalDocument.Id, SourceText.From("updated"));
+
+        var analysis = await AnalyzeRuntimeDocumentChangesAsync(
+            baselineProject,
+            updatedSolution.GetProject(baselineProject.Id)!,
+            cancellationToken);
+
+        Assert.True((bool)analysis.GetType().GetProperty("Success")!.GetValue(analysis)!);
+    }
+
+    [Fact]
+    public async Task Session_RejectsEnhancedLineSpanMappedGeneratedDocument()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var inputDocument = baselineProject.Documents.Single(document =>
+            string.Equals(document.FilePath, fixture.SourcePath, StringComparison.OrdinalIgnoreCase));
+        var updatedSolution = baselineSolution.WithDocumentText(
+            inputDocument.Id,
+            SourceText.From(SourceGeneratorProjectFixture.InputSource(
+                generatedLines: 0,
+                value: 1,
+                generatedLineSpanDirective: 1)));
+
+        var analysis = await AnalyzeRuntimeDocumentChangesAsync(
+            baselineProject,
+            updatedSolution.GetProject(baselineProject.Id)!,
+            cancellationToken);
 
         Assert.False((bool)analysis.GetType().GetProperty("Success")!.GetValue(analysis)!);
         var error = (string?)analysis.GetType().GetProperty("Error")!.GetValue(analysis);
@@ -1990,6 +2089,23 @@ public sealed class HotReloadDeltaSessionTests
         return (Microsoft.CodeAnalysis.Solution)field.GetValue(session)!;
     }
 
+    private static async Task<object> AnalyzeRuntimeDocumentChangesAsync(
+        Microsoft.CodeAnalysis.Project baselineProject,
+        Microsoft.CodeAnalysis.Project updatedProject,
+        CancellationToken cancellationToken)
+    {
+        var analyze = typeof(HotReloadDeltaSession).GetMethod(
+            "AnalyzeRuntimeDocumentChangesAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var analysisTask = (Task)analyze.Invoke(null, [
+            baselineProject,
+            updatedProject,
+            cancellationToken
+        ])!;
+        await analysisTask;
+        return analysisTask.GetType().GetProperty("Result")!.GetValue(analysisTask)!;
+    }
+
     private sealed class RazorProjectFixture : IDisposable
     {
         private RazorProjectFixture(string root)
@@ -2095,6 +2211,24 @@ public sealed class HotReloadDeltaSessionTests
             }
             """;
 
+        public const string LiteralWhitespaceBaseline = """
+            @namespace RazorDeltaFixture
+            <p>@A("a b")</p>
+            <p>@A("ab")</p>
+            @code {
+                private string A(string value) => value;
+            }
+            """;
+
+        public const string LiteralWhitespaceSwapped = """
+            @namespace RazorDeltaFixture
+            <p>@A("ab")</p>
+            <p>@A("a b")</p>
+            @code {
+                private string A(string value) => value;
+            }
+            """;
+
         public const string SameLinePointsBaseline = """
             @namespace RazorDeltaFixture
             <p>@A(1) @B(2)</p>
@@ -2178,6 +2312,7 @@ public sealed class HotReloadDeltaSessionTests
             Root = root;
             ProjectPath = Path.Combine(root, "GeneratedDeltaFixture.csproj");
             SourcePath = Path.Combine(root, "GeneratorInput.cs");
+            AdditionalPath = Path.Combine(root, "input.cs");
             GeneratorDirectory = Path.Combine(root, "DrivingGenerator");
         }
 
@@ -2187,18 +2322,22 @@ public sealed class HotReloadDeltaSessionTests
 
         public string SourcePath { get; }
 
+        public string AdditionalPath { get; }
+
         private string GeneratorDirectory { get; }
 
         public static string InputSource(
             int generatedLines,
             int value,
-            int generatedLineDirective = 0) => $$"""
+            int generatedLineDirective = 0,
+            int generatedLineSpanDirective = 0) => $$"""
             namespace GeneratedDeltaFixture;
 
             public static class GeneratorInput
             {
                 public const int GeneratedLines = {{generatedLines}};
                 public const int GeneratedLineDirective = {{generatedLineDirective}};
+                public const int GeneratedLineSpanDirective = {{generatedLineSpanDirective}};
                 public static int Value() => {{value}};
             }
             """;
@@ -2259,10 +2398,19 @@ public sealed class HotReloadDeltaSessionTests
                             .OfType<LiteralExpressionSyntax>()
                             .Select(static literal => (int)literal.Token.Value!)
                             .Single();
+                        var generatedLineSpanDirective = context.Compilation.SyntaxTrees
+                            .SelectMany(static tree => tree.GetRoot().DescendantNodes().OfType<VariableDeclaratorSyntax>())
+                            .Where(static variable => variable.Identifier.ValueText == "GeneratedLineSpanDirective")
+                            .Select(static variable => variable.Initializer?.Value)
+                            .OfType<LiteralExpressionSyntax>()
+                            .Select(static literal => (int)literal.Token.Value!)
+                            .Single();
                         var padding = string.Concat(Enumerable.Repeat("        // generated padding\n", generatedLines));
-                        var lineDirective = generatedLineDirective == 0
-                            ? string.Empty
-                            : $"        #line {generatedLineDirective} \"input.cs\"\n";
+                        var lineDirective = generatedLineSpanDirective != 0
+                            ? "        #line (1,1)-(1,10) \"untracked.cs\"\n"
+                            : generatedLineDirective == 0
+                                ? string.Empty
+                                : $"        #line {generatedLineDirective} \"input.cs\"\n";
                         var source = $$"""
                             namespace GeneratedDeltaFixture;
 
@@ -2287,6 +2435,8 @@ public sealed class HotReloadDeltaSessionTests
                   </PropertyGroup>
                   <ItemGroup>
                     <Compile Remove="DrivingGenerator\**\*.cs" />
+                    <Compile Remove="input.cs" />
+                    <AdditionalFiles Include="input.cs" />
                     <ProjectReference Include="DrivingGenerator\DrivingGenerator.csproj"
                                       OutputItemType="Analyzer"
                                       ReferenceOutputAssembly="false" />
@@ -2297,6 +2447,7 @@ public sealed class HotReloadDeltaSessionTests
                 fixture.SourcePath,
                 InputSource(generatedLines: 0, value: 1),
                 cancellationToken);
+            await File.WriteAllTextAsync(fixture.AdditionalPath, "baseline", cancellationToken);
 
             var startInfo = new ProcessStartInfo
             {
