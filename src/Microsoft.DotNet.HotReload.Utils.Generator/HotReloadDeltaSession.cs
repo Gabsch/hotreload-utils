@@ -623,6 +623,29 @@ public sealed class HotReloadDeltaSession : IDisposable
             .DescendantTrivia(descendIntoTrivia: true)
             .Any(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia));
 
+    private static bool ContainsUnaccountedLineDirective(
+        SourceText text,
+        IEnumerable<string> changedAdditionalFiles)
+    {
+        var accountedPaths = changedAdditionalFiles.ToHashSet(PathComparer);
+        return CSharpSyntaxTree.ParseText(text)
+            .GetRoot()
+            .DescendantTrivia(descendIntoTrivia: true)
+            .Where(static trivia => trivia.IsKind(SyntaxKind.LineDirectiveTrivia))
+            .Select(static trivia => (LineDirectiveTriviaSyntax)trivia.GetStructure()!)
+            .Any(directive =>
+            {
+                if (directive.Line.IsKind(SyntaxKind.DefaultKeyword) ||
+                    directive.Line.IsKind(SyntaxKind.HiddenKeyword))
+                {
+                    return false;
+                }
+
+                var mappedPath = TryGetFullPath(directive.File.ValueText);
+                return mappedPath is null || !accountedPaths.Contains(mappedPath);
+            });
+    }
+
     private static async Task<RuntimeDocumentChangeAnalysisResult> AnalyzeRuntimeDocumentChangesAsync(
         Project pdbProject,
         Project updatedProject,
@@ -697,6 +720,13 @@ public sealed class HotReloadDeltaSession : IDisposable
             if (committedText.ContentEquals(updatedText))
             {
                 continue;
+            }
+
+            if (ContainsUnaccountedLineDirective(committedText, additionalFiles) ||
+                ContainsUnaccountedLineDirective(updatedText, additionalFiles))
+            {
+                return RuntimeDocumentChangeAnalysisResult.Fail(
+                    $"Changed source-generated document '{updatedDocument.Name}' contains #line mappings that are not owned by a changed additional document and cannot be correlated exactly; restart/replay is required.");
             }
 
             var generatedPath = TryGetFullPath(updatedDocument.FilePath ?? string.Empty);
@@ -1071,8 +1101,8 @@ public sealed class HotReloadDeltaSession : IDisposable
             return false;
         }
 
-        var oldAnchors = oldPoints.Select(point => CreateSourcePointAnchor(point, oldText)).ToArray();
-        var newAnchors = newPoints.Select(point => CreateSourcePointAnchor(point, newText)).ToArray();
+        var oldAnchors = oldPoints.Select(point => CreateSourcePointIdentityAnchor(point, oldText)).ToArray();
+        var newAnchors = newPoints.Select(point => CreateSourcePointIdentityAnchor(point, newText)).ToArray();
         for (var index = 0; index < oldPoints.Count; index++)
         {
             var oldPoint = oldPoints[index];
@@ -1086,33 +1116,17 @@ public sealed class HotReloadDeltaSession : IDisposable
             }
 
             var oldAnchor = oldAnchors[index];
-            if (oldAnchor is not null)
+            var newAnchor = newAnchors[index];
+            if (oldAnchor is null || newAnchor is null)
             {
-                var movedMatches = newAnchors
-                    .Select((anchor, candidateIndex) => (anchor, candidateIndex))
-                    .Where(candidate => string.Equals(candidate.anchor, oldAnchor, StringComparison.Ordinal))
-                    .Select(static candidate => candidate.candidateIndex)
-                    .ToArray();
-                if (movedMatches.Length == 1 && movedMatches[0] != index)
-                {
-                    error = $"point {index} retained its source identity at new point {movedMatches[0]}";
-                    return false;
-                }
+                error = $"point {index} lacks complete source identity evidence";
+                return false;
             }
 
-            var newAnchor = newAnchors[index];
-            if (newAnchor is not null)
+            if (!string.Equals(oldAnchor, newAnchor, StringComparison.Ordinal))
             {
-                var movedMatches = oldAnchors
-                    .Select((anchor, candidateIndex) => (anchor, candidateIndex))
-                    .Where(candidate => string.Equals(candidate.anchor, newAnchor, StringComparison.Ordinal))
-                    .Select(static candidate => candidate.candidateIndex)
-                    .ToArray();
-                if (movedMatches.Length == 1 && movedMatches[0] != index)
-                {
-                    error = $"new point {index} retained its source identity at old point {movedMatches[0]}";
-                    return false;
-                }
+                error = $"point {index} does not retain a one-to-one source identity";
+                return false;
             }
         }
 
@@ -1120,7 +1134,7 @@ public sealed class HotReloadDeltaSession : IDisposable
         return true;
     }
 
-    private static string? CreateSourcePointAnchor(PortableSequencePoint point, SourceText text)
+    private static string? CreateSourcePointIdentityAnchor(PortableSequencePoint point, SourceText text)
     {
         if (point.StartLine < 0 ||
             point.StartLine >= text.Lines.Count ||
@@ -1139,8 +1153,14 @@ public sealed class HotReloadDeltaSession : IDisposable
             return null;
         }
 
-        return string.Concat(text.ToString(TextSpan.FromBounds(start, end))
-            .Where(static character => !char.IsWhiteSpace(character)));
+        var source = text.ToString(TextSpan.FromBounds(start, end));
+        var tokens = SyntaxFactory.ParseTokens(source)
+            .Where(static token => !token.IsKind(SyntaxKind.EndOfFileToken))
+            .Select(static token => token.IsKind(SyntaxKind.IdentifierToken)
+                ? $"identifier:{token.ValueText}"
+                : token.Kind().ToString())
+            .ToArray();
+        return tokens.Length == 0 ? null : string.Join('|', tokens);
     }
 
     private static ImmutableArray<string> FindMissingPaths(

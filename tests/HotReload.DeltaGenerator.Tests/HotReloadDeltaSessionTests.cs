@@ -144,6 +144,36 @@ public sealed class HotReloadDeltaSessionTests
     }
 
     [Fact]
+    public async Task Session_RejectsEditedRazorExecutableRegionPermutationWithSameLineMultiset()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await RazorProjectFixture.CreateAsync(
+            cancellationToken,
+            RazorProjectFixture.SwappedRegionsBaseline);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var update = await session.PrepareUpdateAsync([
+            new(fixture.ComponentPath, RazorProjectFixture.SwappedAndEditedRegionsUpdated)
+        ], cancellationToken);
+
+        Assert.Equal(
+            RazorProjectFixture.SwappedRegionsBaseline.Split('\n').Length,
+            RazorProjectFixture.SwappedAndEditedRegionsUpdated.Split('\n').Length);
+        Assert.Equal(HotReloadDeltaUpdateStatus.RestartRequired, update.Status);
+        Assert.False(update.LineUpdatesComplete);
+        Assert.Empty(update.MetadataDelta);
+        Assert.False(session.HasPendingUpdate);
+        Assert.Contains(update.Warnings, warning =>
+            warning.Contains("identities", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
     public async Task Session_PreservesSameLineRazorSequencePointMultiplicity()
     {
         var cancellationToken = TestContext.Current.CancellationToken;
@@ -227,6 +257,46 @@ public sealed class HotReloadDeltaSessionTests
             Assert.Empty(update.MetadataDelta);
             Assert.False(session.HasPendingUpdate);
         }
+    }
+
+    [Fact]
+    public async Task Session_RejectsLineMappedChangedSourceGeneratedDocumentsBeforeDeltaClassification()
+    {
+        var cancellationToken = TestContext.Current.CancellationToken;
+        using var fixture = await SourceGeneratorProjectFixture.CreateAsync(cancellationToken);
+        using var session = await HotReloadDeltaSession.StartAsync(
+            fixture.ProjectPath,
+            "Debug",
+            "net10.0",
+            properties: null,
+            runtimeCapabilities: ["Baseline"],
+            cancellationToken);
+
+        var baselineSolution = ReadSessionSolution(session, "pdbSolution");
+        var baselineProject = baselineSolution.Projects.Single(project =>
+            string.Equals(project.FilePath, fixture.ProjectPath, StringComparison.OrdinalIgnoreCase));
+        var inputDocument = baselineProject.Documents.Single(document =>
+            string.Equals(document.FilePath, fixture.SourcePath, StringComparison.OrdinalIgnoreCase));
+        var updatedSolution = baselineSolution.WithDocumentText(
+            inputDocument.Id,
+            SourceText.From(SourceGeneratorProjectFixture.InputSource(
+                generatedLines: 0,
+                value: 1,
+                generatedLineDirective: 2)));
+        var analyze = typeof(HotReloadDeltaSession).GetMethod(
+            "AnalyzeRuntimeDocumentChangesAsync",
+            BindingFlags.NonPublic | BindingFlags.Static)!;
+        var analysisTask = (Task)analyze.Invoke(null, [
+            baselineProject,
+            updatedSolution.GetProject(baselineProject.Id)!,
+            cancellationToken
+        ])!;
+        await analysisTask;
+        var analysis = analysisTask.GetType().GetProperty("Result")!.GetValue(analysisTask)!;
+
+        Assert.False((bool)analysis.GetType().GetProperty("Success")!.GetValue(analysis)!);
+        var error = (string?)analysis.GetType().GetProperty("Error")!.GetValue(analysis);
+        Assert.Contains("#line", error, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]
@@ -1970,6 +2040,16 @@ public sealed class HotReloadDeltaSessionTests
             }
             """;
 
+        public const string SwappedAndEditedRegionsUpdated = """
+            @namespace RazorDeltaFixture
+            <p>@B(3)</p>
+            <p>@A(4)</p>
+            @code {
+                private int A(int value) => value;
+                private int B(int value) => value;
+            }
+            """;
+
         public const string SameLinePointsBaseline = """
             @namespace RazorDeltaFixture
             <p>@A(1) @B(2)</p>
@@ -2064,12 +2144,16 @@ public sealed class HotReloadDeltaSessionTests
 
         private string GeneratorDirectory { get; }
 
-        public static string InputSource(int generatedLines, int value) => $$"""
+        public static string InputSource(
+            int generatedLines,
+            int value,
+            int generatedLineDirective = 0) => $$"""
             namespace GeneratedDeltaFixture;
 
             public static class GeneratorInput
             {
                 public const int GeneratedLines = {{generatedLines}};
+                public const int GeneratedLineDirective = {{generatedLineDirective}};
                 public static int Value() => {{value}};
             }
             """;
@@ -2123,7 +2207,17 @@ public sealed class HotReloadDeltaSessionTests
                             .OfType<LiteralExpressionSyntax>()
                             .Select(static literal => (int)literal.Token.Value!)
                             .Single();
+                        var generatedLineDirective = context.Compilation.SyntaxTrees
+                            .SelectMany(static tree => tree.GetRoot().DescendantNodes().OfType<VariableDeclaratorSyntax>())
+                            .Where(static variable => variable.Identifier.ValueText == "GeneratedLineDirective")
+                            .Select(static variable => variable.Initializer?.Value)
+                            .OfType<LiteralExpressionSyntax>()
+                            .Select(static literal => (int)literal.Token.Value!)
+                            .Single();
                         var padding = string.Concat(Enumerable.Repeat("        // generated padding\n", generatedLines));
+                        var lineDirective = generatedLineDirective == 0
+                            ? string.Empty
+                            : $"        #line {generatedLineDirective} \"input.cs\"\n";
                         var source = $$"""
                             namespace GeneratedDeltaFixture;
 
@@ -2131,7 +2225,7 @@ public sealed class HotReloadDeltaSessionTests
                             {
                                 public static int GetValue()
                                 {
-                            {{padding}}        return 10;
+                            {{padding}}{{lineDirective}}        return 10;
                                 }
                             }
                             """;
